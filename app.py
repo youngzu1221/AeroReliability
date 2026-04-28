@@ -1,89 +1,58 @@
-import streamlit as st
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from scipy.optimize import minimize
-from scipy.special import gamma
-
-st.set_page_config(layout="wide")
-
-st.title("🔧 Reliability & Weibull Analysis Dashboard")
-
-# ==========================================
-# SIDEBAR INPUTS
-# ==========================================
-st.sidebar.header("Inputs")
-
-mttr = st.sidebar.number_input("MTTR", value=10.0)
-t_current = st.sidebar.number_input("In Service Time", value=5000.0)
-t_future = st.sidebar.number_input("Future Runtime", value=500.0)
-Cp = st.sidebar.number_input("Preventive Cost (Cp)", value=1000.0)
-Cf = st.sidebar.number_input("Failure Cost (Cf)", value=10000.0)
-
-# ==========================================
-# FILE UPLOAD
-# ==========================================
-uploaded_file = st.file_uploader("Upload Excel File (Each column = component)")
-
-datasets = {}
-
-if uploaded_file:
-    df = pd.read_excel(uploaded_file)
-
-    for col in df.columns:
-        data = df[col].dropna().values
-        if len(data) > 0:
-            datasets[col] = data
-
-else:
-    st.info("Using sample data")
-    datasets = {
-        "Component_A": np.array([928, 1675, 5354, 5554, 5705, 5779]),
-        "Component_B": np.array([5806, 5934, 5965, 6070, 6089]),
-    }
-
-# ==========================================
-# FUNCTIONS
-# ==========================================
-def neg_ll(params, t):
-    b, e = params
-    if b <= 0 or e <= 0:
-        return 1e10
-    n = len(t)
-    ll = n*np.log(b) - n*b*np.log(e) + (b-1)*np.sum(np.log(t)) - np.sum((t/e)**b)
-    return -ll
-
-def R(t, b, e):
-    return np.exp(-(t/e)**b)
-
-def hazard(t, b, e):
-    return (b/e)*(t/e)**(b-1)
-
-# ==========================================
-# MAIN ANALYSIS
-# ==========================================
 results = []
 
 for name, data in datasets.items():
 
     data = np.sort(data)
 
+    # Weibull MLE
     res = minimize(neg_ll, [1.0, np.mean(data)], args=(data,), method='Nelder-Mead')
     beta, eta = res.x
 
+    # Core metrics
     mttf = eta * gamma(1 + 1/beta)
-    cond_rel = R(t_current + t_future, beta, eta) / R(t_current, beta, eta)
+    mtbf = mttf + mttr
+
+    R_current = R(t_current, beta, eta)
+    R_uncond = R(t_current + t_future, beta, eta)
+
+    cond_rel = R_uncond / R_current if R_current > 0 else 0
     prob_fail = 1 - cond_rel
+
     RUL = mttf - t_current
 
+    # Optimization
     T_range = np.linspace(100, max(data)*1.5, 300)
     cost = (Cp + Cf*(1 - R(T_range, beta, eta))) / T_range
     opt_T = T_range[np.argmin(cost)]
 
-    results.append([name, beta, eta, prob_fail, RUL, opt_T])
+    # Store results
+    results.append([
+        name, beta, eta,
+        mttf, mtbf,
+        R_uncond, R_current,
+        cond_rel, prob_fail,
+        RUL, opt_T
+    ])
 
     # ======================================
-    # PLOTS (SCATTER STYLE)
+    # DISPLAY KEY METRICS (PER COMPONENT)
+    # ======================================
+    st.subheader(f"📌 {name} Key Metrics")
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("MTTF", f"{mttf:.2f}")
+    c2.metric("MTBF", f"{mtbf:.2f}")
+    c3.metric("RUL", f"{RUL:.2f}")
+
+    c4, c5, c6 = st.columns(3)
+    c4.metric("R(T)", f"{R_current:.2%}")
+    c5.metric("R(T+t)", f"{R_uncond:.2%}")
+    c6.metric("Conditional Reliability", f"{cond_rel:.2%}")
+
+    st.metric("Conditional Probability of Failure", f"{prob_fail:.2%}")
+
+    # ======================================
+    # PLOTS (KEEP YOUR STYLE)
     # ======================================
     col1, col2, col3 = st.columns(3)
 
@@ -119,34 +88,3 @@ for name, data in datasets.items():
     ax3.set_title(f"{name} Hazard")
     ax3.grid()
     col3.pyplot(fig3)
-
-# ==========================================
-# RESULTS TABLE
-# ==========================================
-df_results = pd.DataFrame(results, columns=[
-    "Component", "Beta", "Eta", "Failure Probability", "RUL", "Optimal Replacement"
-])
-
-df_results = df_results.sort_values(by="Failure Probability", ascending=False)
-
-st.subheader("📊 Component Risk Ranking")
-st.dataframe(df_results)
-
-# ==========================================
-# ALERTS
-# ==========================================
-st.subheader("🚨 Alerts")
-
-for _, row in df_results.iterrows():
-    if row["Failure Probability"] > 0.6:
-        st.error(f"{row['Component']} → HIGH RISK")
-    elif row["Failure Probability"] > 0.3:
-        st.warning(f"{row['Component']} → MEDIUM RISK")
-    else:
-        st.success(f"{row['Component']} → LOW RISK")
-
-# ==========================================
-# DOWNLOAD
-# ==========================================
-csv = df_results.to_csv(index=False).encode('utf-8')
-st.download_button("Download Results", csv, "results.csv", "text/csv")
