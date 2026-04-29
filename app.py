@@ -1,66 +1,114 @@
-import streamlit as st
+from __future__ import annotations
+
+from dataclasses import dataclass
+from io import BytesIO
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+import streamlit as st
+from matplotlib.backends.backend_pdf import PdfPages
+from matplotlib.ticker import MultipleLocator
 from scipy.optimize import minimize
 from scipy.special import gamma
+
 
 # ============================================================
 # PAGE SETUP
 # ============================================================
-st.set_page_config(page_title="Reliability & Weibull Dashboard", layout="wide")
-st.title("🔧 Reliability & Weibull Predictive Dashboard")
+st.set_page_config(
+    page_title="Reliability & Weibull Pro Dashboard",
+    page_icon="🔧",
+    layout="wide",
+)
+
 
 # ============================================================
-# FUNCTIONS
+# CONSTANTS
 # ============================================================
-def reliability(t, beta, eta):
-    t = np.asarray(t, dtype=float)
-    t = np.maximum(t, 1e-12)
-    return np.exp(-((t / eta) ** beta))
+EPS = 1e-12
+RISK_THRESHOLDS = {
+    "high": 0.60,
+    "medium": 0.30,
+}
 
-def hazard(t, beta, eta):
-    t = np.asarray(t, dtype=float)
-    t = np.maximum(t, 1e-12)
-    return (beta / eta) * (t / eta) ** (beta - 1)
 
-def weibull_pdf(t, beta, eta):
-    t = np.asarray(t, dtype=float)
-    t = np.maximum(t, 1e-12)
-    return (beta / eta) * (t / eta) ** (beta - 1) * np.exp(-((t / eta) ** beta))
+# ============================================================
+# MODELS
+# ============================================================
+@dataclass(frozen=True)
+class WeibullResult:
+    component: str
+    data: np.ndarray
+    beta: float
+    eta: float
+    mttf: float
+    mtbf: float
+    current_reliability: float
+    mission_reliability: float
+    conditional_reliability: float
+    conditional_failure_probability: float
+    rul: float
+    optimal_replacement: float
+    min_cost_rate: float
+    failure_mode: str
+    risk: str
 
-def neg_log_likelihood(params, data):
+
+# ============================================================
+# NUMERIC HELPERS
+# ============================================================
+def clean_life_data(values: pd.Series | np.ndarray) -> np.ndarray:
+    arr = pd.to_numeric(pd.Series(values), errors="coerce").dropna().to_numpy(dtype=float)
+    arr = arr[np.isfinite(arr)]
+    arr = arr[arr > 0]
+    return np.sort(arr)
+
+
+def reliability(t: np.ndarray | float, beta: float, eta: float) -> np.ndarray:
+    t_arr = np.maximum(np.asarray(t, dtype=float), EPS)
+    return np.exp(-((t_arr / eta) ** beta))
+
+
+def hazard(t: np.ndarray | float, beta: float, eta: float) -> np.ndarray:
+    t_arr = np.maximum(np.asarray(t, dtype=float), EPS)
+    return (beta / eta) * (t_arr / eta) ** (beta - 1.0)
+
+
+def weibull_pdf(t: np.ndarray | float, beta: float, eta: float) -> np.ndarray:
+    t_arr = np.maximum(np.asarray(t, dtype=float), EPS)
+    return hazard(t_arr, beta, eta) * reliability(t_arr, beta, eta)
+
+
+def weibull_cdf(t: np.ndarray | float, beta: float, eta: float) -> np.ndarray:
+    return 1.0 - reliability(t, beta, eta)
+
+
+def weibull_quantile(probability: float, beta: float, eta: float) -> float:
+    p = float(np.clip(probability, EPS, 1.0 - EPS))
+    return float(eta * (-np.log(1.0 - p)) ** (1.0 / beta))
+
+
+def neg_log_likelihood(params: np.ndarray, data: np.ndarray) -> float:
     beta, eta = params
     if beta <= 0 or eta <= 0:
         return 1e20
 
-    data = np.asarray(data, dtype=float)
-    data = data[np.isfinite(data)]
-    data = data[data > 0]
-
-    if len(data) < 2:
-        return 1e20
-
     n = len(data)
-    ll = (
+    log_likelihood = (
         n * np.log(beta)
         - n * beta * np.log(eta)
-        + (beta - 1) * np.sum(np.log(data))
+        + (beta - 1.0) * np.sum(np.log(data))
         - np.sum((data / eta) ** beta)
     )
-    return -ll
+    return float(-log_likelihood)
 
-def estimate_weibull_mle(data):
-    data = np.asarray(data, dtype=float)
-    data = data[np.isfinite(data)]
-    data = data[data > 0]
-    data = np.sort(data)
 
+def estimate_weibull_mle(data: np.ndarray) -> tuple[float, float]:
     if len(data) < 2:
-        raise ValueError("Need at least 2 valid positive data points.")
+        raise ValueError("Need at least 2 valid positive observations.")
 
-    initial_guess = np.array([1.5, float(np.mean(data)) if np.mean(data) > 0 else 1.0])
-
+    initial_guess = np.array([1.5, max(float(np.mean(data)), EPS)])
     result = minimize(
         neg_log_likelihood,
         x0=initial_guess,
@@ -70,327 +118,1190 @@ def estimate_weibull_mle(data):
     )
 
     if not result.success:
-        raise RuntimeError(result.message)
+        raise RuntimeError(str(result.message))
 
     beta, eta = result.x
     return float(beta), float(eta)
 
-def fmt_pct(x):
-    return f"{float(x):.2%}"
 
-def risk_label(p):
-    if p >= 0.60:
+def cost_based_optimal_replacement(
+    data: np.ndarray,
+    beta: float,
+    eta: float,
+    preventive_cost: float,
+    failure_cost: float,
+) -> tuple[float, float, np.ndarray, np.ndarray]:
+    start = max(EPS, float(np.min(data) * 0.25))
+    end = max(float(np.max(data) * 2.0), start + 1.0)
+    t_range = np.linspace(start, end, 1000)
+    cost_rate = (preventive_cost + failure_cost * weibull_cdf(t_range, beta, eta)) / t_range
+    idx = int(np.argmin(cost_rate))
+    return float(t_range[idx]), float(cost_rate[idx]), t_range, cost_rate
+
+
+def failure_mode_from_beta(beta: float) -> str:
+    if beta < 0.95:
+        return "Infant mortality"
+    if beta <= 1.05:
+        return "Random failure"
+    return "Wear-out"
+
+
+def risk_label(probability: float) -> str:
+    if probability >= RISK_THRESHOLDS["high"]:
         return "HIGH"
-    elif p >= 0.30:
+    if probability >= RISK_THRESHOLDS["medium"]:
         return "MEDIUM"
     return "LOW"
 
-def parse_excel(uploaded_file):
-    df = pd.read_excel(uploaded_file)
-    datasets = {}
-    for col in df.columns:
-        s = pd.to_numeric(df[col], errors="coerce").dropna()
-        arr = np.sort(s.to_numpy(dtype=float))
-        if len(arr) > 0:
-            datasets[str(col)] = arr
-    return datasets
 
-def sample_datasets():
+def fmt_pct(value: float) -> str:
+    return f"{float(value):.2%}"
+
+
+def fmt_money(value: float) -> str:
+    return f"${float(value):,.2f}"
+
+
+def axis_limits(low: float, high: float, pad: float) -> tuple[float, float]:
+    span = high - low
+    if span <= 0:
+        span = max(1.0, abs(high), 1.0)
+    return low - span * pad, high + span * pad
+
+
+def axis_limits_with_margin(low: float, high: float, pad: float, margin: float = 0.03) -> tuple[float, float]:
+    return axis_limits(low, high, pad + margin)
+
+
+def distribution_time_limits(data: np.ndarray) -> tuple[float, float]:
+    data_min = float(np.min(data))
+    data_max = float(np.max(data))
+    low = max(EPS, data_min * 0.5)
+    high = max(data_max * 1.2, low + 1.0)
+    return low, high
+
+
+PLOT_ADJUSTMENT_TARGETS = [
+    "All plots",
+    "PDF",
+    "CDF",
+    "Hazard Function",
+    "Conditional Reliability",
+    "Conditional Failure Probability",
+    "Hazard Trend",
+    "Cost Rate",
+    "None",
+]
+
+
+def plot_padding(target: str, plot_name: str, x_pad: float, y_pad: float) -> tuple[float, float]:
+    if target == "All plots" or target == plot_name:
+        return x_pad, y_pad
+    return 0.0, 0.0
+
+
+def plot_axis_config(target: str, plot_name: str, axis_config: dict[str, float | bool]) -> dict[str, float | bool]:
+    if target == "All plots" or target == plot_name:
+        return axis_config
+    return {}
+
+
+def state_key(value: str) -> str:
+    return value.lower().replace(" ", "_").replace("/", "_")
+
+
+def default_plot_padding(target: str) -> float:
+    return 0.05 if target == "All plots" else 0.0
+
+
+def sync_adjustment(source_key: str, canonical_key: str, mirror_key: str) -> None:
+    value = float(st.session_state[source_key])
+    st.session_state[canonical_key] = value
+    st.session_state[mirror_key] = value
+
+
+def reset_active_axis_adjustment() -> None:
+    target = st.session_state.get("axis_adjustment_target", "All plots")
+    default_value = default_plot_padding(target)
+
+    for key in (
+        "axis_x_pad",
+        "axis_x_pad_slider",
+        "axis_x_pad_number",
+        "axis_y_pad",
+        "axis_y_pad_slider",
+        "axis_y_pad_number",
+    ):
+        st.session_state[key] = default_value
+
+    for key in (
+        "axis_use_x_bounds",
+        "axis_x_min",
+        "axis_x_max",
+        "axis_use_y_bounds",
+        "axis_y_min",
+        "axis_y_max",
+        "axis_use_major_units",
+        "axis_x_major_unit",
+        "axis_y_major_unit",
+    ):
+        st.session_state.pop(key, None)
+
+
+def adjustment_control(label: str, canonical_key: str) -> float:
+    slider_key = f"{canonical_key}_slider"
+    number_key = f"{canonical_key}_number"
+
+    st.session_state.setdefault(slider_key, float(st.session_state[canonical_key]))
+    st.session_state.setdefault(number_key, float(st.session_state[canonical_key]))
+
+    slider_col, number_col = st.columns([0.68, 0.32])
+    with slider_col:
+        st.slider(
+            label,
+            0.0,
+            1.0,
+            step=0.01,
+            key=slider_key,
+            on_change=sync_adjustment,
+            args=(slider_key, canonical_key, number_key),
+        )
+    with number_col:
+        st.number_input(
+            f"{label} value",
+            min_value=0.0,
+            max_value=1.0,
+            step=0.01,
+            format="%.2f",
+            key=number_key,
+            label_visibility="collapsed",
+            on_change=sync_adjustment,
+            args=(number_key, canonical_key, slider_key),
+        )
+
+    return float(st.session_state[canonical_key])
+
+
+def axis_bounds_and_units_control() -> dict[str, float | bool]:
+    with st.expander("Axis bounds and units", expanded=False):
+        st.caption("Excel-style manual bounds and major units for the selected plot target.")
+
+        use_x_bounds = st.checkbox("Custom X-axis bounds", key="axis_use_x_bounds")
+        x_col_1, x_col_2 = st.columns(2)
+        with x_col_1:
+            x_min = st.number_input("X minimum", value=0.0, step=100.0, disabled=not use_x_bounds, key="axis_x_min")
+        with x_col_2:
+            x_max = st.number_input("X maximum", value=1000.0, step=100.0, disabled=not use_x_bounds, key="axis_x_max")
+
+        use_y_bounds = st.checkbox("Custom Y-axis bounds", key="axis_use_y_bounds")
+        y_col_1, y_col_2 = st.columns(2)
+        with y_col_1:
+            y_min = st.number_input("Y minimum", value=0.0, step=0.01, format="%.6f", disabled=not use_y_bounds, key="axis_y_min")
+        with y_col_2:
+            y_max = st.number_input("Y maximum", value=1.0, step=0.01, format="%.6f", disabled=not use_y_bounds, key="axis_y_max")
+
+        use_major_units = st.checkbox("Custom major units", key="axis_use_major_units")
+        u_col_1, u_col_2 = st.columns(2)
+        with u_col_1:
+            x_major_unit = st.number_input(
+                "X major unit",
+                min_value=0.0,
+                value=100.0,
+                step=100.0,
+                disabled=not use_major_units,
+                key="axis_x_major_unit",
+            )
+        with u_col_2:
+            y_major_unit = st.number_input(
+                "Y major unit",
+                min_value=0.0,
+                value=0.10,
+                step=0.01,
+                format="%.6f",
+                disabled=not use_major_units,
+                key="axis_y_major_unit",
+            )
+
     return {
-        "Component_A": np.array([
-            928.9936, 1675.1729, 5354.2334, 5554.634, 5574.3295,
-            5579.8798, 5625.0248, 5647.0735, 5705.0101, 5779.6506,
-            5786.7997, 5806.2507, 5809.2236, 5934.8736, 5941.1176,
-            5965.4527, 5968.6011, 5981.9664, 6070.8261, 6087.7153
-        ]),
-        "Component_B": np.array([
-            6089.3006, 6139.7166, 6144.9501, 6188.6527, 6229.9567,
-            6269.3167, 6311.3682, 6321.6174, 6331.5658, 6345.3501,
-            6360.1913, 6365.9809, 6393.4409, 6395.3338, 6411.2999
-        ]),
-        "Component_C": np.array([
-            6420.254, 6426.0969, 6453.4502, 6458.4883, 6468.7205,
-            6473.452, 6484.9734, 6502.7477, 6518.1449, 6520.6828,
-            6522.0342, 6522.3946, 6523.9841, 6528.3539, 6530.8394
-        ]),
+        "use_x_bounds": use_x_bounds,
+        "x_min": float(x_min),
+        "x_max": float(x_max),
+        "use_y_bounds": use_y_bounds,
+        "y_min": float(y_min),
+        "y_max": float(y_max),
+        "use_major_units": use_major_units,
+        "x_major_unit": float(x_major_unit),
+        "y_major_unit": float(y_major_unit),
     }
 
-# ============================================================
-# SIDEBAR INPUTS
-# ============================================================
-st.sidebar.header("Inputs")
 
-mttr = st.sidebar.number_input("MTTR", min_value=0.0, value=10.0, step=1.0)
-t_current = st.sidebar.number_input("In Service Time", min_value=0.0, value=5000.0, step=100.0)
-t_future = st.sidebar.number_input("Future Runtime", min_value=0.0, value=500.0, step=100.0)
-Cp = st.sidebar.number_input("Preventive Cost (Cp)", min_value=0.0, value=1000.0, step=100.0)
-Cf = st.sidebar.number_input("Failure Cost (Cf)", min_value=0.0, value=10000.0, step=100.0)
-prediction_horizon = st.sidebar.slider("Prediction Horizon (Cycles)", 100, 10000, 3000, 100)
+def apply_axis_bounds_and_units(
+    ax,
+    axis_config: dict[str, float | bool],
+    x_limits: tuple[float, float],
+    y_limits: tuple[float, float],
+) -> None:
+    x_low, x_high = x_limits
+    y_low, y_high = y_limits
 
-uploaded_file = st.file_uploader("Upload Excel File (each column = one component)", type=["xlsx", "xls"])
+    if axis_config.get("use_x_bounds"):
+        configured_min = float(axis_config.get("x_min", x_low))
+        configured_max = float(axis_config.get("x_max", x_high))
+        if configured_max > configured_min:
+            x_low, x_high = configured_min, configured_max
+
+    if axis_config.get("use_y_bounds"):
+        configured_min = float(axis_config.get("y_min", y_low))
+        configured_max = float(axis_config.get("y_max", y_high))
+        if configured_max > configured_min:
+            y_low, y_high = configured_min, configured_max
+
+    ax.set_xlim(x_low, x_high)
+    ax.set_ylim(y_low, y_high)
+
+    if axis_config.get("use_major_units"):
+        x_major = float(axis_config.get("x_major_unit", 0.0))
+        y_major = float(axis_config.get("y_major_unit", 0.0))
+        if x_major > 0:
+            ax.xaxis.set_major_locator(MultipleLocator(x_major))
+        if y_major > 0:
+            ax.yaxis.set_major_locator(MultipleLocator(y_major))
+
 
 # ============================================================
-# DATA LOADING
+# DATA IO
 # ============================================================
-if uploaded_file is not None:
-    try:
-        datasets = parse_excel(uploaded_file)
-        if not datasets:
-            st.error("No valid numeric columns were found in the uploaded file.")
-            st.stop()
-    except Exception as e:
-        st.error(f"Could not read file: {e}")
-        st.stop()
-else:
-    st.info("No file uploaded. Using sample data.")
-    datasets = sample_datasets()
+@st.cache_data(show_spinner=False)
+def parse_excel(uploaded_file) -> dict[str, np.ndarray]:
+    df = pd.read_excel(uploaded_file)
+    datasets: dict[str, np.ndarray] = {}
+
+    for col in df.columns:
+        cleaned = clean_life_data(df[col])
+        if len(cleaned) > 1:
+            datasets[str(col)] = cleaned
+
+    return datasets
+
+
+def build_template_workbook() -> bytes:
+    example = pd.DataFrame(
+        {
+            "Pump A": [1200, 1450, 1680, 1710, 2100, 2380],
+            "Motor B": [800, 950, 1010, 1250, 1360, 1510],
+            "Bearing C": [300, 420, 510, 740, 860, 930],
+        }
+    )
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        example.to_excel(writer, index=False, sheet_name="failure_times")
+    return buffer.getvalue()
+
+
+def analyze_component(
+    component: str,
+    data: np.ndarray,
+    mttr: float,
+    current_age: float,
+    mission_time: float,
+    preventive_cost: float,
+    failure_cost: float,
+) -> WeibullResult:
+    beta, eta = estimate_weibull_mle(data)
+    mttf = float(eta * gamma(1.0 + 1.0 / beta))
+    mtbf = float(mttf + mttr)
+
+    current_rel = float(reliability(current_age, beta, eta))
+    mission_rel = float(reliability(current_age + mission_time, beta, eta))
+    conditional_rel = mission_rel / current_rel if current_rel > EPS else 0.0
+    conditional_rel = float(np.clip(conditional_rel, 0.0, 1.0))
+    conditional_fail = float(np.clip(1.0 - conditional_rel, 0.0, 1.0))
+
+    optimal_replacement, min_cost_rate, _, _ = cost_based_optimal_replacement(
+        data,
+        beta,
+        eta,
+        preventive_cost,
+        failure_cost,
+    )
+
+    return WeibullResult(
+        component=component,
+        data=data,
+        beta=beta,
+        eta=eta,
+        mttf=mttf,
+        mtbf=mtbf,
+        current_reliability=current_rel,
+        mission_reliability=mission_rel,
+        conditional_reliability=conditional_rel,
+        conditional_failure_probability=conditional_fail,
+        rul=float(mttf - current_age),
+        optimal_replacement=optimal_replacement,
+        min_cost_rate=min_cost_rate,
+        failure_mode=failure_mode_from_beta(beta),
+        risk=risk_label(conditional_fail),
+    )
+
+
+def results_to_frame(results: dict[str, WeibullResult]) -> pd.DataFrame:
+    rows = []
+    for result in results.values():
+        rows.append(
+            {
+                "Component": result.component,
+                "Beta": result.beta,
+                "Eta": result.eta,
+                "MTTF": result.mttf,
+                "MTBF": result.mtbf,
+                "Conditional Reliability": result.conditional_reliability,
+                "Conditional Probability of Failure": result.conditional_failure_probability,
+                "RUL": result.rul,
+                "Optimal Replacement": result.optimal_replacement,
+                "Min Cost Rate": result.min_cost_rate,
+                "Failure Mode": result.failure_mode,
+                "Risk": result.risk,
+            }
+        )
+    return (
+        pd.DataFrame(rows)
+        .sort_values("Conditional Probability of Failure", ascending=False)
+        .reset_index(drop=True)
+    )
+
+
+def display_results_table(df: pd.DataFrame) -> None:
+    display_df = df.copy()
+    pct_cols = [
+        "Conditional Reliability",
+        "Conditional Probability of Failure",
+    ]
+    numeric_cols = ["Beta", "Eta", "MTTF", "MTBF", "RUL", "Optimal Replacement"]
+    money_cols = ["Min Cost Rate"]
+
+    for col in pct_cols:
+        display_df[col] = display_df[col].map(fmt_pct)
+    for col in numeric_cols:
+        display_df[col] = display_df[col].map(lambda x: f"{x:,.2f}")
+    for col in money_cols:
+        display_df[col] = display_df[col].map(fmt_money)
+
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+
+def formatted_results_frame(df: pd.DataFrame) -> pd.DataFrame:
+    display_df = df.copy()
+    pct_cols = [
+        "Conditional Reliability",
+        "Conditional Probability of Failure",
+    ]
+    numeric_cols = ["Beta", "Eta", "MTTF", "MTBF", "RUL", "Optimal Replacement"]
+    money_cols = ["Min Cost Rate"]
+
+    for col in pct_cols:
+        display_df[col] = display_df[col].map(fmt_pct)
+    for col in numeric_cols:
+        display_df[col] = display_df[col].map(lambda x: f"{x:,.2f}")
+    for col in money_cols:
+        display_df[col] = display_df[col].map(fmt_money)
+
+    return display_df
+
+
+def highest_risk_component_text(df: pd.DataFrame) -> str:
+    high_risk_components = df.loc[df["Risk"] == "HIGH", "Component"].astype(str).tolist()
+    if high_risk_components:
+        return ", ".join(high_risk_components)
+
+    highest_probability = float(df["Conditional Probability of Failure"].max())
+    highest_components = df.loc[
+        np.isclose(df["Conditional Probability of Failure"], highest_probability),
+        "Component",
+    ].astype(str)
+    return ", ".join(highest_components.tolist())
+
+
+def safe_filename(value: str) -> str:
+    safe = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in value.strip())
+    return safe or "component"
+
+
+def add_dataframe_page(pdf: PdfPages, title: str, df: pd.DataFrame, rows_per_page: int = 18) -> None:
+    page_count = max(1, int(np.ceil(len(df) / rows_per_page)))
+
+    for page_index in range(page_count):
+        page_df = df.iloc[page_index * rows_per_page : (page_index + 1) * rows_per_page]
+        fig, ax = plt.subplots(figsize=(11.7, 8.3))
+        ax.axis("off")
+        ax.set_title(
+            f"{title} ({page_index + 1}/{page_count})" if page_count > 1 else title,
+            fontsize=16,
+            fontweight="bold",
+            pad=18,
+        )
+        table = ax.table(
+            cellText=page_df.values,
+            colLabels=page_df.columns,
+            loc="center",
+            cellLoc="center",
+            colLoc="center",
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(7)
+        table.scale(1.0, 1.35)
+        pdf.savefig(fig, bbox_inches="tight")
+        plt.close(fig)
+
+
+def build_fleet_summary_pdf(df_results: pd.DataFrame) -> bytes:
+    buffer = BytesIO()
+    with PdfPages(buffer) as pdf:
+        fig, ax = plt.subplots(figsize=(11.7, 8.3))
+        ax.axis("off")
+        top_row = df_results.iloc[0]
+        summary_lines = [
+            "Reliability & Weibull Fleet Summary",
+            "",
+            f"Components analyzed: {len(df_results)}",
+            f"Highest failure probability: {fmt_pct(top_row['Conditional Probability of Failure'])}",
+            f"Highest risk component(s): {highest_risk_component_text(df_results)}",
+            f"Average beta: {df_results['Beta'].mean():.2f}",
+            f"Average MTTF: {df_results['MTTF'].mean():,.2f}",
+        ]
+        ax.text(0.05, 0.90, summary_lines[0], fontsize=20, fontweight="bold", transform=ax.transAxes)
+        ax.text(0.05, 0.78, "\n".join(summary_lines[2:]), fontsize=13, va="top", transform=ax.transAxes)
+        pdf.savefig(fig, bbox_inches="tight")
+        plt.close(fig)
+
+        add_dataframe_page(pdf, "Full Reliability Results", formatted_results_frame(df_results))
+
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def build_component_deep_dive_pdf(
+    result: WeibullResult,
+    current_age: float,
+    horizon: float,
+    preventive_cost: float,
+    failure_cost: float,
+    adjustment_target: str,
+    x_pad: float,
+    y_pad: float,
+    axis_config: dict[str, float | bool] | None = None,
+) -> bytes:
+    axis_config = axis_config or {}
+    buffer = BytesIO()
+    with PdfPages(buffer) as pdf:
+        fig, ax = plt.subplots(figsize=(11.7, 8.3))
+        ax.axis("off")
+        details = [
+            f"Component: {result.component}",
+            f"Risk: {result.risk}",
+            f"Conditional failure probability: {fmt_pct(result.conditional_failure_probability)}",
+            f"Conditional reliability: {fmt_pct(result.conditional_reliability)}",
+            f"Beta: {result.beta:.3f}",
+            f"Eta: {result.eta:,.2f}",
+            f"MTTF: {result.mttf:,.2f}",
+            f"MTBF: {result.mtbf:,.2f}",
+            f"RUL: {result.rul:,.2f}",
+            f"Optimal replacement: {result.optimal_replacement:,.2f}",
+            f"Preventive cost: {fmt_money(preventive_cost)}",
+            f"Failure cost: {fmt_money(failure_cost)}",
+            f"Minimum cost rate: {fmt_money(result.min_cost_rate)}",
+            f"Failure mode: {result.failure_mode}",
+        ]
+        ax.text(0.05, 0.90, "Component Deep Dive", fontsize=20, fontweight="bold", transform=ax.transAxes)
+        ax.text(0.05, 0.80, "\n".join(details), fontsize=13, va="top", transform=ax.transAxes)
+        pdf.savefig(fig, bbox_inches="tight")
+        plt.close(fig)
+
+        distribution_fig = build_distribution_fit_figure(result, adjustment_target, x_pad, y_pad, axis_config, for_pdf=True)
+        pdf.savefig(distribution_fig, bbox_inches="tight")
+        plt.close(distribution_fig)
+
+        forward_fig = build_forward_risk_figure(result, current_age, horizon, adjustment_target, x_pad, y_pad, axis_config)
+        pdf.savefig(forward_fig, bbox_inches="tight")
+        plt.close(forward_fig)
+
+        cost_fig = build_cost_curve_figure(result, preventive_cost, failure_cost, adjustment_target, x_pad, y_pad, axis_config)
+        pdf.savefig(cost_fig, bbox_inches="tight")
+        plt.close(cost_fig)
+
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def build_reliability_report_pdf(
+    df_results: pd.DataFrame,
+    result: WeibullResult,
+    current_age: float,
+    horizon: float,
+    preventive_cost: float,
+    failure_cost: float,
+    adjustment_target: str,
+    x_pad: float,
+    y_pad: float,
+    axis_config: dict[str, float | bool],
+) -> bytes:
+    buffer = BytesIO()
+    with PdfPages(buffer) as pdf:
+        fig, ax = plt.subplots(figsize=(11.7, 8.3))
+        ax.axis("off")
+        top_row = df_results.iloc[0]
+        summary_lines = [
+            "Reliability & Weibull Report",
+            "",
+            "Fleet Summary",
+            f"Components analyzed: {len(df_results)}",
+            f"Highest failure probability: {fmt_pct(top_row['Conditional Probability of Failure'])}",
+            f"Highest risk component(s): {highest_risk_component_text(df_results)}",
+            f"Average beta: {df_results['Beta'].mean():.2f}",
+            f"Average MTTF: {df_results['MTTF'].mean():,.2f}",
+            "",
+            f"Selected component: {result.component}",
+            f"Preventive cost: {fmt_money(preventive_cost)}",
+            f"Failure cost: {fmt_money(failure_cost)}",
+            f"Minimum cost rate: {fmt_money(result.min_cost_rate)}",
+        ]
+        ax.text(0.05, 0.90, summary_lines[0], fontsize=20, fontweight="bold", transform=ax.transAxes)
+        ax.text(0.05, 0.80, "\n".join(summary_lines[2:]), fontsize=13, va="top", transform=ax.transAxes)
+        pdf.savefig(fig, bbox_inches="tight")
+        plt.close(fig)
+
+        add_dataframe_page(pdf, "Full Reliability Results", formatted_results_frame(df_results))
+
+        fig, ax = plt.subplots(figsize=(11.7, 8.3))
+        ax.axis("off")
+        details = [
+            f"Component: {result.component}",
+            f"Risk: {result.risk}",
+            f"Conditional failure probability: {fmt_pct(result.conditional_failure_probability)}",
+            f"Conditional reliability: {fmt_pct(result.conditional_reliability)}",
+            f"Beta: {result.beta:.3f}",
+            f"Eta: {result.eta:,.2f}",
+            f"MTTF: {result.mttf:,.2f}",
+            f"MTBF: {result.mtbf:,.2f}",
+            f"RUL: {result.rul:,.2f}",
+            f"Optimal replacement: {result.optimal_replacement:,.2f}",
+            f"Preventive cost: {fmt_money(preventive_cost)}",
+            f"Failure cost: {fmt_money(failure_cost)}",
+            f"Minimum cost rate: {fmt_money(result.min_cost_rate)}",
+            f"Failure mode: {result.failure_mode}",
+        ]
+        ax.text(0.05, 0.90, "Component Deep Dive", fontsize=20, fontweight="bold", transform=ax.transAxes)
+        ax.text(0.05, 0.80, "\n".join(details), fontsize=13, va="top", transform=ax.transAxes)
+        pdf.savefig(fig, bbox_inches="tight")
+        plt.close(fig)
+
+        distribution_fig = build_distribution_fit_figure(result, adjustment_target, x_pad, y_pad, axis_config, for_pdf=True)
+        pdf.savefig(distribution_fig, bbox_inches="tight")
+        plt.close(distribution_fig)
+
+        forward_fig = build_forward_risk_figure(result, current_age, horizon, adjustment_target, x_pad, y_pad, axis_config)
+        pdf.savefig(forward_fig, bbox_inches="tight")
+        plt.close(forward_fig)
+
+        cost_fig = build_cost_curve_figure(result, preventive_cost, failure_cost, adjustment_target, x_pad, y_pad, axis_config)
+        pdf.savefig(cost_fig, bbox_inches="tight")
+        plt.close(cost_fig)
+
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+# ============================================================
+# PLOTTING
+# ============================================================
+def plot_distribution_fit(
+    result: WeibullResult,
+    adjustment_target: str,
+    x_pad: float,
+    y_pad: float,
+    axis_config: dict[str, float | bool],
+) -> None:
+    data = result.data
+    beta = result.beta
+    eta = result.eta
+
+    n = len(data)
+    ranks = np.arange(1, n + 1)
+    median_ranks = (ranks - 0.3) / (n + 0.4)
+
+    distribution_start, distribution_end = distribution_time_limits(data)
+    distribution_range = np.linspace(distribution_start, distribution_end, 1200)
+
+    hazard_start = max(EPS, float(np.min(data)) * 0.5)
+    hazard_end = max(float(np.max(data)) * 1.75, eta * 1.5, hazard_start + 1.0)
+    hazard_range = np.linspace(hazard_start, hazard_end, 1000)
+
+    pdf_curve = weibull_pdf(distribution_range, beta, eta)
+    cdf_curve = weibull_cdf(distribution_range, beta, eta)
+    haz_curve = hazard(hazard_range, beta, eta)
+    pdf_points = weibull_pdf(data, beta, eta)
+
+    pdf_x_pad, pdf_y_pad = plot_padding(adjustment_target, "PDF", x_pad, y_pad)
+    cdf_x_pad, cdf_y_pad = plot_padding(adjustment_target, "CDF", x_pad, y_pad)
+    haz_x_pad, haz_y_pad = plot_padding(adjustment_target, "Hazard Function", x_pad, y_pad)
+    pdf_axis_config = plot_axis_config(adjustment_target, "PDF", axis_config)
+    cdf_axis_config = plot_axis_config(adjustment_target, "CDF", axis_config)
+    haz_axis_config = plot_axis_config(adjustment_target, "Hazard Function", axis_config)
+
+    pdf_x_low, pdf_x_high = axis_limits(distribution_start, distribution_end, pdf_x_pad)
+    cdf_x_low, cdf_x_high = axis_limits(distribution_start, distribution_end, cdf_x_pad)
+    haz_x_low, haz_x_high = axis_limits(hazard_start, hazard_end, haz_x_pad)
+    pdf_y_high_value = float(max(np.max(pdf_curve), np.max(pdf_points)))
+    pdf_y_low, pdf_y_high = axis_limits_with_margin(0.0, pdf_y_high_value, pdf_y_pad, margin=0.04)
+    haz_y_low, haz_y_high = axis_limits_with_margin(
+        float(np.min(haz_curve)),
+        float(np.max(haz_curve)),
+        haz_y_pad,
+        margin=0.04,
+    )
+
+    col_pdf, col_cdf = st.columns(2)
+
+    fig_pdf, ax_pdf = plt.subplots(figsize=(8, 4))
+    ax_pdf.plot(distribution_range, pdf_curve, label="MLE model")
+    ax_pdf.scatter(data, pdf_points, s=28, label="Observations", clip_on=False)
+    ax_pdf.set_title("PDF")
+    ax_pdf.set_xlabel("Time")
+    ax_pdf.set_ylabel("Density")
+    apply_axis_bounds_and_units(ax_pdf, pdf_axis_config, (pdf_x_low, pdf_x_high), (pdf_y_low, pdf_y_high))
+    ax_pdf.grid(True, linestyle="--", alpha=0.45)
+    ax_pdf.legend()
+    col_pdf.pyplot(fig_pdf, clear_figure=True)
+
+    fig_cdf, ax_cdf = plt.subplots(figsize=(8, 4))
+    ax_cdf.plot(distribution_range, cdf_curve, label="MLE model")
+    ax_cdf.scatter(data, median_ranks, s=28, label="Median ranks", clip_on=False)
+    ax_cdf.set_title("CDF / Unreliability")
+    ax_cdf.set_xlabel("Time")
+    ax_cdf.set_ylabel("Probability")
+    cdf_y_margin = 0.03 + cdf_y_pad
+    apply_axis_bounds_and_units(ax_cdf, cdf_axis_config, (cdf_x_low, cdf_x_high), (-cdf_y_margin, 1.0 + cdf_y_margin))
+    ax_cdf.grid(True, linestyle="--", alpha=0.45)
+    ax_cdf.legend()
+    col_cdf.pyplot(fig_cdf, clear_figure=True)
+
+    fig_haz, ax_haz = plt.subplots(figsize=(9, 3.2))
+    ax_haz.plot(hazard_range, haz_curve, label="Hazard rate")
+    ax_haz.set_title("Hazard Function")
+    ax_haz.set_xlabel("Time")
+    ax_haz.set_ylabel("Failure rate")
+    apply_axis_bounds_and_units(ax_haz, haz_axis_config, (haz_x_low, haz_x_high), (haz_y_low, haz_y_high))
+    ax_haz.grid(True, linestyle="--", alpha=0.45)
+    ax_haz.legend()
+    _, hazard_col, _ = st.columns([0.1, 0.8, 0.1])
+    hazard_col.pyplot(fig_haz, clear_figure=True)
+
+
+def plot_forward_risk(
+    result: WeibullResult,
+    current_age: float,
+    horizon: float,
+    adjustment_target: str,
+    x_pad: float,
+    y_pad: float,
+    axis_config: dict[str, float | bool],
+) -> None:
+    beta = result.beta
+    eta = result.eta
+    requested_horizon = max(float(horizon), 0.0)
+    plot_horizon = max(requested_horizon, 1.0)
+    future_times = np.linspace(max(EPS, current_age), current_age + plot_horizon, 250)
+
+    current_rel = float(reliability(current_age, beta, eta))
+    if requested_horizon <= 0:
+        conditional_rel = np.ones_like(future_times)
+        conditional_fail = np.zeros_like(future_times)
+        haz = np.full_like(future_times, float(hazard(current_age, beta, eta)))
+    else:
+        rel = reliability(future_times, beta, eta)
+        conditional_rel = rel / current_rel if current_rel > EPS else np.zeros_like(rel)
+        conditional_rel = np.clip(conditional_rel, 0.0, 1.0)
+        conditional_fail = 1.0 - conditional_rel
+        haz = hazard(future_times, beta, eta)
+
+    rel_x_pad, rel_y_pad = plot_padding(adjustment_target, "Conditional Reliability", x_pad, y_pad)
+    fail_x_pad, fail_y_pad = plot_padding(adjustment_target, "Conditional Failure Probability", x_pad, y_pad)
+    haz_x_pad, haz_y_pad = plot_padding(adjustment_target, "Hazard Trend", x_pad, y_pad)
+    rel_axis_config = plot_axis_config(adjustment_target, "Conditional Reliability", axis_config)
+    fail_axis_config = plot_axis_config(adjustment_target, "Conditional Failure Probability", axis_config)
+    haz_axis_config = plot_axis_config(adjustment_target, "Hazard Trend", axis_config)
+
+    rel_x_low, rel_x_high = axis_limits(float(future_times.min()), float(future_times.max()), rel_x_pad)
+    fail_x_low, fail_x_high = axis_limits(float(future_times.min()), float(future_times.max()), fail_x_pad)
+    haz_x_low, haz_x_high = axis_limits(float(future_times.min()), float(future_times.max()), haz_x_pad)
+    haz_y_low, haz_y_high = axis_limits_with_margin(float(haz.min()), float(haz.max()), haz_y_pad, margin=0.04)
+
+    col_rel, col_fail, col_haz = st.columns(3)
+
+    fig_rel, ax_rel = plt.subplots(figsize=(6, 4))
+    ax_rel.plot(future_times, conditional_rel)
+    ax_rel.axvline(current_age, color="black", linestyle="--", alpha=0.65)
+    ax_rel.set_title("Conditional Reliability")
+    ax_rel.set_xlabel("Time")
+    ax_rel.set_ylabel("Reliability")
+    rel_y_margin = 0.03 + rel_y_pad
+    apply_axis_bounds_and_units(ax_rel, rel_axis_config, (rel_x_low, rel_x_high), (-rel_y_margin, 1.0 + rel_y_margin))
+    ax_rel.grid(True, linestyle="--", alpha=0.45)
+    col_rel.pyplot(fig_rel, clear_figure=True)
+
+    fig_fail, ax_fail = plt.subplots(figsize=(6, 4))
+    ax_fail.plot(future_times, conditional_fail)
+    ax_fail.axvline(current_age, color="black", linestyle="--", alpha=0.65)
+    ax_fail.set_title("Conditional Failure Probability")
+    ax_fail.set_xlabel("Time")
+    ax_fail.set_ylabel("Probability")
+    fail_y_margin = 0.03 + fail_y_pad
+    apply_axis_bounds_and_units(ax_fail, fail_axis_config, (fail_x_low, fail_x_high), (-fail_y_margin, 1.0 + fail_y_margin))
+    ax_fail.grid(True, linestyle="--", alpha=0.45)
+    col_fail.pyplot(fig_fail, clear_figure=True)
+
+    fig_haz, ax_haz = plt.subplots(figsize=(6, 4))
+    ax_haz.plot(future_times, haz)
+    ax_haz.axvline(current_age, color="black", linestyle="--", alpha=0.65)
+    ax_haz.set_title("Hazard Trend")
+    ax_haz.set_xlabel("Time")
+    ax_haz.set_ylabel("Failure rate")
+    apply_axis_bounds_and_units(ax_haz, haz_axis_config, (haz_x_low, haz_x_high), (haz_y_low, haz_y_high))
+    ax_haz.grid(True, linestyle="--", alpha=0.45)
+    col_haz.pyplot(fig_haz, clear_figure=True)
+
+    horizon_failure = float(conditional_fail[-1])
+    if horizon_failure >= 0.70:
+        st.error(f"Very high conditional risk within the next {requested_horizon:,.0f} cycles: {fmt_pct(horizon_failure)}")
+    elif horizon_failure >= 0.40:
+        st.warning(f"Moderate conditional risk within the next {requested_horizon:,.0f} cycles: {fmt_pct(horizon_failure)}")
+    else:
+        st.success(f"Low conditional risk within the next {requested_horizon:,.0f} cycles: {fmt_pct(horizon_failure)}")
+
+
+def plot_cost_curve(
+    result: WeibullResult,
+    preventive_cost: float,
+    failure_cost: float,
+    adjustment_target: str,
+    x_pad: float,
+    y_pad: float,
+    axis_config: dict[str, float | bool],
+) -> None:
+    t_range, cost_rate = cost_based_optimal_replacement(
+        result.data,
+        result.beta,
+        result.eta,
+        preventive_cost,
+        failure_cost,
+    )[2:]
+
+    cost_x_pad, cost_y_pad = plot_padding(adjustment_target, "Cost Rate", x_pad, y_pad)
+    cost_axis_config = plot_axis_config(adjustment_target, "Cost Rate", axis_config)
+    x_low, x_high = axis_limits(float(t_range.min()), float(t_range.max()), cost_x_pad)
+    y_low, y_high = axis_limits_with_margin(float(cost_rate.min()), float(cost_rate.max()), cost_y_pad, margin=0.04)
+
+    fig, ax = plt.subplots(figsize=(12, 4))
+    ax.plot(t_range, cost_rate)
+    ax.axvline(result.optimal_replacement, color="crimson", linestyle="--", label="Optimal replacement")
+    ax.set_title("Cost Rate by Replacement Time")
+    ax.set_xlabel("Replacement time")
+    ax.set_ylabel("Expected cost rate ($/time)")
+    apply_axis_bounds_and_units(ax, cost_axis_config, (x_low, x_high), (y_low, y_high))
+    ax.grid(True, linestyle="--", alpha=0.45)
+    ax.legend()
+    st.pyplot(fig, clear_figure=True)
+
+
+def build_distribution_fit_figure(
+    result: WeibullResult,
+    adjustment_target: str,
+    x_pad: float,
+    y_pad: float,
+    axis_config: dict[str, float | bool],
+    for_pdf: bool = False,
+) -> plt.Figure:
+    data = result.data
+    beta = result.beta
+    eta = result.eta
+
+    n = len(data)
+    ranks = np.arange(1, n + 1)
+    median_ranks = (ranks - 0.3) / (n + 0.4)
+
+    distribution_start, distribution_end = distribution_time_limits(data)
+    distribution_range = np.linspace(distribution_start, distribution_end, 1200)
+
+    hazard_start = max(EPS, float(np.min(data)) * 0.5)
+    hazard_end = max(float(np.max(data)) * 1.75, eta * 1.5, hazard_start + 1.0)
+    hazard_range = np.linspace(hazard_start, hazard_end, 1000)
+
+    pdf_curve = weibull_pdf(distribution_range, beta, eta)
+    cdf_curve = weibull_cdf(distribution_range, beta, eta)
+    haz_curve = hazard(hazard_range, beta, eta)
+    pdf_points = weibull_pdf(data, beta, eta)
+
+    pdf_x_pad, pdf_y_pad = plot_padding(adjustment_target, "PDF", x_pad, y_pad)
+    cdf_x_pad, cdf_y_pad = plot_padding(adjustment_target, "CDF", x_pad, y_pad)
+    haz_x_pad, haz_y_pad = plot_padding(adjustment_target, "Hazard Function", x_pad, y_pad)
+    pdf_axis_config = plot_axis_config(adjustment_target, "PDF", axis_config)
+    cdf_axis_config = plot_axis_config(adjustment_target, "CDF", axis_config)
+    haz_axis_config = plot_axis_config(adjustment_target, "Hazard Function", axis_config)
+
+    pdf_x_low, pdf_x_high = axis_limits(distribution_start, distribution_end, pdf_x_pad)
+    cdf_x_low, cdf_x_high = axis_limits(distribution_start, distribution_end, cdf_x_pad)
+    haz_x_low, haz_x_high = axis_limits(hazard_start, hazard_end, haz_x_pad)
+    pdf_y_low, pdf_y_high = axis_limits_with_margin(
+        0.0,
+        float(max(np.max(pdf_curve), np.max(pdf_points))),
+        pdf_y_pad,
+        margin=0.04,
+    )
+    haz_y_low, haz_y_high = axis_limits_with_margin(
+        float(np.min(haz_curve)),
+        float(np.max(haz_curve)),
+        haz_y_pad,
+        margin=0.04,
+    )
+
+    fig = plt.figure(figsize=(11.7, 8.3 if for_pdf else 7.5))
+    grid = fig.add_gridspec(2, 2, height_ratios=[1.0, 0.85], hspace=0.42, wspace=0.25)
+    ax_pdf = fig.add_subplot(grid[0, 0])
+    ax_cdf = fig.add_subplot(grid[0, 1])
+    ax_haz = fig.add_subplot(grid[1, :])
+
+    ax_pdf.plot(distribution_range, pdf_curve, label="MLE model")
+    ax_pdf.scatter(data, pdf_points, s=22, label="Observations", clip_on=False)
+    ax_pdf.set_title("PDF")
+    ax_pdf.set_xlabel("Time")
+    ax_pdf.set_ylabel("Density")
+    apply_axis_bounds_and_units(ax_pdf, pdf_axis_config, (pdf_x_low, pdf_x_high), (pdf_y_low, pdf_y_high))
+    ax_pdf.grid(True, linestyle="--", alpha=0.45)
+    ax_pdf.legend(fontsize=8)
+
+    ax_cdf.plot(distribution_range, cdf_curve, label="MLE model")
+    ax_cdf.scatter(data, median_ranks, s=22, label="Median ranks", clip_on=False)
+    ax_cdf.set_title("CDF / Unreliability")
+    ax_cdf.set_xlabel("Time")
+    ax_cdf.set_ylabel("Probability")
+    cdf_y_margin = 0.03 + cdf_y_pad
+    apply_axis_bounds_and_units(ax_cdf, cdf_axis_config, (cdf_x_low, cdf_x_high), (-cdf_y_margin, 1.0 + cdf_y_margin))
+    ax_cdf.grid(True, linestyle="--", alpha=0.45)
+    ax_cdf.legend(fontsize=8)
+
+    ax_haz.plot(hazard_range, haz_curve, label="Hazard rate")
+    ax_haz.set_title("Hazard Function")
+    ax_haz.set_xlabel("Time")
+    ax_haz.set_ylabel("Failure rate")
+    apply_axis_bounds_and_units(ax_haz, haz_axis_config, (haz_x_low, haz_x_high), (haz_y_low, haz_y_high))
+    ax_haz.grid(True, linestyle="--", alpha=0.45)
+    ax_haz.legend(fontsize=8)
+
+    fig.suptitle(f"Distribution Fit - {result.component}", fontsize=14, fontweight="bold")
+    return fig
+
+
+def build_forward_risk_figure(
+    result: WeibullResult,
+    current_age: float,
+    horizon: float,
+    adjustment_target: str,
+    x_pad: float,
+    y_pad: float,
+    axis_config: dict[str, float | bool],
+) -> plt.Figure:
+    beta = result.beta
+    eta = result.eta
+    requested_horizon = max(float(horizon), 0.0)
+    plot_horizon = max(requested_horizon, 1.0)
+    future_times = np.linspace(max(EPS, current_age), current_age + plot_horizon, 250)
+
+    current_rel = float(reliability(current_age, beta, eta))
+    if requested_horizon <= 0:
+        conditional_rel = np.ones_like(future_times)
+        conditional_fail = np.zeros_like(future_times)
+        haz = np.full_like(future_times, float(hazard(current_age, beta, eta)))
+    else:
+        rel = reliability(future_times, beta, eta)
+        conditional_rel = rel / current_rel if current_rel > EPS else np.zeros_like(rel)
+        conditional_rel = np.clip(conditional_rel, 0.0, 1.0)
+        conditional_fail = 1.0 - conditional_rel
+        haz = hazard(future_times, beta, eta)
+
+    rel_x_pad, rel_y_pad = plot_padding(adjustment_target, "Conditional Reliability", x_pad, y_pad)
+    fail_x_pad, fail_y_pad = plot_padding(adjustment_target, "Conditional Failure Probability", x_pad, y_pad)
+    haz_x_pad, haz_y_pad = plot_padding(adjustment_target, "Hazard Trend", x_pad, y_pad)
+    rel_axis_config = plot_axis_config(adjustment_target, "Conditional Reliability", axis_config)
+    fail_axis_config = plot_axis_config(adjustment_target, "Conditional Failure Probability", axis_config)
+    haz_axis_config = plot_axis_config(adjustment_target, "Hazard Trend", axis_config)
+
+    rel_x_low, rel_x_high = axis_limits(float(future_times.min()), float(future_times.max()), rel_x_pad)
+    fail_x_low, fail_x_high = axis_limits(float(future_times.min()), float(future_times.max()), fail_x_pad)
+    haz_x_low, haz_x_high = axis_limits(float(future_times.min()), float(future_times.max()), haz_x_pad)
+    haz_y_low, haz_y_high = axis_limits_with_margin(float(haz.min()), float(haz.max()), haz_y_pad, margin=0.04)
+
+    fig, axes = plt.subplots(1, 3, figsize=(11.7, 4.2))
+    rel_y_margin = 0.03 + rel_y_pad
+    fail_y_margin = 0.03 + fail_y_pad
+
+    axes[0].plot(future_times, conditional_rel)
+    axes[0].axvline(current_age, color="black", linestyle="--", alpha=0.65)
+    axes[0].set_title("Conditional Reliability")
+    axes[0].set_xlabel("Time")
+    axes[0].set_ylabel("Reliability")
+    apply_axis_bounds_and_units(axes[0], rel_axis_config, (rel_x_low, rel_x_high), (-rel_y_margin, 1.0 + rel_y_margin))
+    axes[0].grid(True, linestyle="--", alpha=0.45)
+
+    axes[1].plot(future_times, conditional_fail)
+    axes[1].axvline(current_age, color="black", linestyle="--", alpha=0.65)
+    axes[1].set_title("Conditional Failure Probability")
+    axes[1].set_xlabel("Time")
+    axes[1].set_ylabel("Probability")
+    apply_axis_bounds_and_units(axes[1], fail_axis_config, (fail_x_low, fail_x_high), (-fail_y_margin, 1.0 + fail_y_margin))
+    axes[1].grid(True, linestyle="--", alpha=0.45)
+
+    axes[2].plot(future_times, haz)
+    axes[2].axvline(current_age, color="black", linestyle="--", alpha=0.65)
+    axes[2].set_title("Hazard Trend")
+    axes[2].set_xlabel("Time")
+    axes[2].set_ylabel("Failure rate")
+    apply_axis_bounds_and_units(axes[2], haz_axis_config, (haz_x_low, haz_x_high), (haz_y_low, haz_y_high))
+    axes[2].grid(True, linestyle="--", alpha=0.45)
+
+    fig.suptitle(f"Forward Risk Trend - {result.component}", fontsize=14, fontweight="bold")
+    fig.tight_layout()
+    return fig
+
+
+def build_cost_curve_figure(
+    result: WeibullResult,
+    preventive_cost: float,
+    failure_cost: float,
+    adjustment_target: str,
+    x_pad: float,
+    y_pad: float,
+    axis_config: dict[str, float | bool],
+) -> plt.Figure:
+    t_range, cost_rate = cost_based_optimal_replacement(
+        result.data,
+        result.beta,
+        result.eta,
+        preventive_cost,
+        failure_cost,
+    )[2:]
+
+    cost_x_pad, cost_y_pad = plot_padding(adjustment_target, "Cost Rate", x_pad, y_pad)
+    cost_axis_config = plot_axis_config(adjustment_target, "Cost Rate", axis_config)
+    x_low, x_high = axis_limits(float(t_range.min()), float(t_range.max()), cost_x_pad)
+    y_low, y_high = axis_limits_with_margin(float(cost_rate.min()), float(cost_rate.max()), cost_y_pad, margin=0.04)
+
+    fig, ax = plt.subplots(figsize=(11.7, 4.2))
+    ax.plot(t_range, cost_rate)
+    ax.axvline(result.optimal_replacement, color="crimson", linestyle="--", label="Optimal replacement")
+    ax.set_title(f"Replacement Economics - {result.component}")
+    ax.set_xlabel("Replacement time")
+    ax.set_ylabel("Expected cost rate ($/time)")
+    apply_axis_bounds_and_units(ax, cost_axis_config, (x_low, x_high), (y_low, y_high))
+    ax.grid(True, linestyle="--", alpha=0.45)
+    ax.legend()
+    fig.tight_layout()
+    return fig
+
+
+# ============================================================
+# UI
+# ============================================================
+st.title("🔧 Reliability & Weibull Predictive Dashboard Pro")
+st.caption("Upload an Excel workbook where each column is one component and each value is a positive failure/runtime observation.")
+
+with st.sidebar:
+    st.header("Inputs")
+    mttr = st.number_input("MTTR", min_value=0.0, value=0.0, step=1.0)
+    current_age = st.number_input("Current in-service time", min_value=0.0, value=0.0, step=100.0)
+    mission_time = st.number_input("Future mission/runtime", min_value=0.0, value=100.0, step=100.0)
+    preventive_cost = st.number_input("Preventive cost (Cp) $", min_value=0.0, value=500.0, step=100.0)
+    failure_cost = st.number_input("Failure cost (Cf) $", min_value=0.0, value=5000.0, step=500.0)
+    prediction_horizon = st.slider("Prediction horizon", 0, 10000, 0, 100)
+
+    st.divider()
+    st.subheader("Plot padding")
+    st.session_state.setdefault("axis_adjustment_target", "All plots")
+    st.session_state.setdefault("axis_x_pad", default_plot_padding(st.session_state["axis_adjustment_target"]))
+    st.session_state.setdefault("axis_y_pad", default_plot_padding(st.session_state["axis_adjustment_target"]))
+    adjustment_target = st.selectbox(
+        "Apply axis adjustment to",
+        PLOT_ADJUSTMENT_TARGETS,
+        key="axis_adjustment_target",
+        on_change=reset_active_axis_adjustment,
+    )
+    x_pad = adjustment_control("Horizontal adjustment", "axis_x_pad")
+    y_pad = adjustment_control("Vertical adjustment", "axis_y_pad")
+    axis_config = axis_bounds_and_units_control()
+
+    st.divider()
+    st.markdown("**Beta interpretation**")
+    st.markdown("- Beta < 0.95: infant mortality")
+    st.markdown("- 0.95 to 1.05: random failure")
+    st.markdown("- Beta > 1.05: wear-out")
+
+
+template_col, upload_col = st.columns([1, 2])
+with template_col:
+    st.download_button(
+        "Download Excel Template",
+        data=build_template_workbook(),
+        file_name="weibull_input_template.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+with upload_col:
+    uploaded_file = st.file_uploader(
+        "Upload Excel file",
+        type=["xlsx", "xls"],
+        help="Each column should contain failure times or life observations for one component.",
+    )
+
+if uploaded_file is None:
+    st.info("Upload an Excel file to begin the analysis.")
+    st.stop()
+
+try:
+    datasets = parse_excel(uploaded_file)
+except Exception as exc:
+    st.error(f"Could not read the workbook: {exc}")
+    st.stop()
 
 if not datasets:
-    st.error("No data found.")
+    st.error("No valid component columns were found. Each usable column needs at least two positive numeric values.")
     st.stop()
 
-# ============================================================
-# ANALYSIS
-# ============================================================
-results = []
+analysis: dict[str, WeibullResult] = {}
+skipped: list[str] = []
 
-for name, data in datasets.items():
-    data = np.asarray(data, dtype=float)
-    data = data[np.isfinite(data)]
-    data = data[data > 0]
-    data = np.sort(data)
+for component, data in datasets.items():
+    try:
+        analysis[component] = analyze_component(
+            component,
+            data,
+            mttr,
+            current_age,
+            mission_time,
+            preventive_cost,
+            failure_cost,
+        )
+    except Exception as exc:
+        skipped.append(f"{component}: {exc}")
 
-    if len(data) < 2:
-        continue
+if skipped:
+    with st.expander("Skipped components"):
+        for item in skipped:
+            st.warning(item)
 
-    beta, eta = estimate_weibull_mle(data)
-
-    mttf = eta * gamma(1.0 + 1.0 / beta)
-    mtbf = mttf + mttr
-
-    r_current = float(reliability(t_current, beta, eta))
-    r_future = float(reliability(t_current + t_future, beta, eta))
-
-    conditional_reliability = r_future / r_current if r_current > 0 else 0.0
-    conditional_reliability = float(np.clip(conditional_reliability, 0.0, 1.0))
-    conditional_failure_probability = 1.0 - conditional_reliability
-    conditional_failure_probability = float(np.clip(conditional_failure_probability, 0.0, 1.0))
-
-    rul = mttf - t_current
-
-    t_range = np.linspace(
-        max(1e-6, np.min(data) * 0.5),
-        max(np.max(data) * 1.5, t_current + t_future + 1),
-        500,
-    )
-    cost_rate = (Cp + Cf * (1 - reliability(t_range, beta, eta))) / t_range
-    optimal_t = float(t_range[np.argmin(cost_rate)])
-
-    future_times = np.linspace(max(1e-6, t_current), t_current + prediction_horizon, 200)
-    rel_trend = reliability(future_times, beta, eta)
-    fail_trend = 1 - rel_trend
-    haz_trend = hazard(future_times, beta, eta)
-
-    results.append({
-        "Component": name,
-        "Beta": beta,
-        "Eta": eta,
-        "MTTF": mttf,
-        "MTBF": mtbf,
-        "R(T+t)": r_future,
-        "R(T)": r_current,
-        "Conditional Reliability": conditional_reliability,
-        "Conditional Probability of Failure": conditional_failure_probability,
-        "RUL": rul,
-        "Optimal Replacement": optimal_t,
-        "Future Failure at Horizon": float(fail_trend[-1]),
-        "Risk": risk_label(conditional_failure_probability),
-    })
-
-if not results:
-    st.error("No component could be analyzed.")
+if not analysis:
+    st.error("No component could be analyzed after parameter estimation.")
     st.stop()
 
-df_results = pd.DataFrame(results).sort_values(
-    by="Conditional Probability of Failure",
-    ascending=False
-).reset_index(drop=True)
-
-# ============================================================
-# DASHBOARD SUMMARY
-# ============================================================
+df_results = results_to_frame(analysis)
 top_row = df_results.iloc[0]
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Components Analyzed", f"{len(df_results)}")
-c2.metric("Highest Failure Probability", fmt_pct(top_row["Conditional Probability of Failure"]))
-c3.metric("Highest Risk Component", str(top_row["Component"]))
-c4.metric("Risk Level", str(top_row["Risk"]))
+metric_1, metric_2, metric_3, metric_4, metric_5 = st.columns(5)
+metric_1.metric("Components", f"{len(df_results)}")
+metric_2.metric("Highest Failure Probability", fmt_pct(top_row["Conditional Probability of Failure"]))
+metric_3.metric("Highest Risk Component", highest_risk_component_text(df_results))
+metric_4.metric("Average Beta", f"{df_results['Beta'].mean():.2f}")
+metric_5.metric("Average MTTF", f"{df_results['MTTF'].mean():,.2f}")
 
-# ============================================================
-# RESULTS TABLE
-# ============================================================
-st.subheader("📊 Full Reliability Results")
+summary_tab, detail_tab, export_tab = st.tabs(["Fleet Summary", "Component Deep Dive", "Export"])
 
-display_df = df_results.copy()
+with summary_tab:
+    st.subheader("Full Reliability Results")
+    display_results_table(df_results)
 
-for col in ["R(T+t)", "R(T)", "Conditional Reliability", "Conditional Probability of Failure", "Future Failure at Horizon"]:
-    display_df[col] = display_df[col].apply(fmt_pct)
-
-for col in ["Beta", "Eta", "MTTF", "MTBF", "RUL", "Optimal Replacement"]:
-    display_df[col] = display_df[col].map(lambda x: f"{x:,.2f}")
-
-st.dataframe(display_df, use_container_width=True)
-
-csv = df_results.to_csv(index=False).encode("utf-8")
-st.download_button("Download Results CSV", csv, "weibull_results.csv", "text/csv")
-
-# ============================================================
-# COMPONENT DETAIL VIEW
-# ============================================================
-component_names = list(datasets.keys())
-selected_component = st.selectbox("Select a component", component_names)
-
-selected_data = np.asarray(datasets[selected_component], dtype=float)
-selected_data = selected_data[np.isfinite(selected_data)]
-selected_data = selected_data[selected_data > 0]
-selected_data = np.sort(selected_data)
-
-selected_row = df_results[df_results["Component"] == selected_component].iloc[0]
-
-beta = float(selected_row["Beta"])
-eta = float(selected_row["Eta"])
-mttf = float(selected_row["MTTF"])
-mtbf = float(selected_row["MTBF"])
-r_current = float(selected_row["R(T)"])
-r_future = float(selected_row["R(T+t)"])
-conditional_reliability = float(selected_row["Conditional Reliability"])
-conditional_failure_probability = float(selected_row["Conditional Probability of Failure"])
-rul = float(selected_row["RUL"])
-optimal_t = float(selected_row["Optimal Replacement"])
-
-st.subheader(f"📌 {selected_component} Key Metrics")
-
-m1, m2, m3 = st.columns(3)
-m1.metric("MTTF", f"{mttf:,.2f}")
-m2.metric("MTBF", f"{mtbf:,.2f}")
-m3.metric("RUL", f"{rul:,.2f}")
-
-n1, n2, n3 = st.columns(3)
-n1.metric("Unconditional Reliability R(T+t)", fmt_pct(r_future))
-n2.metric("Current Reliability R(T)", fmt_pct(r_current))
-n3.metric("Conditional Reliability", fmt_pct(conditional_reliability))
-
-st.metric("Conditional Probability of Failure", fmt_pct(conditional_failure_probability))
-
-a1, a2 = st.columns(2)
-with a1:
-    if conditional_failure_probability >= 0.60:
-        st.error(f"🚨 HIGH RISK: {selected_component}")
-    elif conditional_failure_probability >= 0.30:
-        st.warning(f"⚠️ MEDIUM RISK: {selected_component}")
+    high_risk = df_results[df_results["Risk"] == "HIGH"]
+    if not high_risk.empty:
+        st.error(f"{len(high_risk)} component(s) are currently classified as HIGH risk.")
     else:
-        st.success(f"✅ LOW RISK: {selected_component}")
+        st.success("No component is currently classified as HIGH risk.")
 
-with a2:
-    st.info(f"Optimal Replacement Time: {optimal_t:,.2f}")
+with detail_tab:
+    selected_component = st.selectbox("Select component", list(analysis.keys()))
+    result = analysis[selected_component]
 
-# ============================================================
-# ORIGINAL STYLE PLOTS
-# ============================================================
-n = len(selected_data)
-ranks = np.arange(1, n + 1)
-median_ranks = (ranks - 0.3) / (n + 0.4)
+    st.markdown(f"### {selected_component}")
+    left, middle, right = st.columns(3)
+    left.metric("Beta", f"{result.beta:.3f}", result.failure_mode)
+    middle.metric("Eta", f"{result.eta:,.2f}")
+    right.metric("Risk", result.risk, fmt_pct(result.conditional_failure_probability))
 
-t_range = np.linspace(
-    max(1e-6, np.min(selected_data) * 0.5),
-    max(np.max(selected_data) * 1.2, t_current + t_future + 1),
-    1000,
-)
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("MTTF", f"{result.mttf:,.2f}")
+    m2.metric("MTBF", f"{result.mtbf:,.2f}")
+    m3.metric("RUL", f"{result.rul:,.2f}")
+    m4.metric("Optimal Replacement", f"{result.optimal_replacement:,.2f}")
+    m5.metric("Min Cost Rate", fmt_money(result.min_cost_rate))
 
-pdf_curve = weibull_pdf(t_range, beta, eta)
-cdf_curve = 1 - np.exp(-((t_range / eta) ** beta))
-pdf_points = weibull_pdf(selected_data, beta, eta)
+    st.metric("Conditional Reliability", fmt_pct(result.conditional_reliability))
 
-st.subheader(f"📈 Distribution Fit - {selected_component}")
-col_pdf, col_cdf = st.columns(2)
+    if result.risk == "HIGH":
+        st.error(f"Immediate maintenance planning is recommended before about {result.optimal_replacement:,.2f}.")
+    elif result.risk == "MEDIUM":
+        st.warning(f"Schedule maintenance soon. Recommended replacement around {result.optimal_replacement:,.2f}.")
+    else:
+        st.success(f"Continue monitoring. Recommended replacement around {result.optimal_replacement:,.2f}.")
 
-fig_pdf, ax_pdf = plt.subplots(figsize=(8, 4))
-ax_pdf.plot(t_range, pdf_curve, label="MLE Model")
-ax_pdf.scatter(selected_data, pdf_points, s=20, label="Actual Data")
-ax_pdf.set_title("PDF (Probability Density)")
-ax_pdf.set_xlabel("Time")
-ax_pdf.set_ylabel("Density")
-ax_pdf.grid(True, linestyle="--", alpha=0.5)
-ax_pdf.legend()
-col_pdf.pyplot(fig_pdf)
+    q10, q50, q90 = (
+        weibull_quantile(0.10, result.beta, result.eta),
+        weibull_quantile(0.50, result.beta, result.eta),
+        weibull_quantile(0.90, result.beta, result.eta),
+    )
+    st.info(f"B10 life: {q10:,.2f} | Median life: {q50:,.2f} | B90 life: {q90:,.2f}")
 
-fig_cdf, ax_cdf = plt.subplots(figsize=(8, 4))
-ax_cdf.plot(t_range, cdf_curve, label="MLE Model")
-ax_cdf.scatter(selected_data, median_ranks, s=20, label="Actual Data")
-ax_cdf.set_title("CDF (Unreliability)")
-ax_cdf.set_xlabel("Time")
-ax_cdf.set_ylabel("Probability")
-ax_cdf.grid(True, linestyle="--", alpha=0.5)
-ax_cdf.legend()
-col_cdf.pyplot(fig_cdf)
+    st.subheader("Distribution Fit")
+    plot_distribution_fit(result, adjustment_target, x_pad, y_pad, axis_config)
 
-fig_haz, ax_haz = plt.subplots(figsize=(8, 4))
-ax_haz.plot(t_range, hazard(t_range, beta, eta), label="Hazard Rate")
-ax_haz.set_title("Hazard Function")
-ax_haz.set_xlabel("Time")
-ax_haz.set_ylabel("Failure Rate")
-ax_haz.grid(True, linestyle="--", alpha=0.5)
-ax_haz.legend()
-st.pyplot(fig_haz)
+    st.subheader("Forward Risk Trend")
+    plot_forward_risk(result, current_age, prediction_horizon, adjustment_target, x_pad, y_pad, axis_config)
 
-# ============================================================
-# TREND OVER TIME
-# ============================================================
-st.subheader(f"📉 Degradation Trend - {selected_component}")
+    st.subheader("Replacement Economics")
+    plot_cost_curve(result, preventive_cost, failure_cost, adjustment_target, x_pad, y_pad, axis_config)
 
-future_times = np.linspace(max(1e-6, t_current), t_current + prediction_horizon, 200)
-rel_trend = reliability(future_times, beta, eta)
-fail_trend = 1 - rel_trend
-haz_trend = hazard(future_times, beta, eta)
+with export_tab:
+    st.subheader("Download Outputs")
+    raw_csv = df_results.to_csv(index=False).encode("utf-8")
+    st.download_button("Download Results CSV", raw_csv, "weibull_results.csv", "text/csv")
 
-trend1, trend2, trend3 = st.columns(3)
+    report_pdf_key = f"reliability_report_pdf_{safe_filename(result.component)}"
+    if st.button("Prepare Reliability Report PDF"):
+        st.session_state[report_pdf_key] = build_reliability_report_pdf(
+            df_results,
+            result,
+            current_age,
+            prediction_horizon,
+            preventive_cost,
+            failure_cost,
+            adjustment_target,
+            x_pad,
+            y_pad,
+            axis_config,
+        )
+    if report_pdf_key in st.session_state:
+        st.download_button(
+            "Download Reliability Report PDF",
+            st.session_state[report_pdf_key],
+            f"reliability_report_{safe_filename(result.component)}.pdf",
+            "application/pdf",
+        )
 
-fig_t1, ax_t1 = plt.subplots(figsize=(6, 4))
-ax_t1.plot(future_times, rel_trend)
-ax_t1.axvline(t_current, linestyle="--")
-ax_t1.set_title("Reliability Decay")
-ax_t1.set_xlabel("Time")
-ax_t1.set_ylabel("Reliability")
-ax_t1.grid(True, linestyle="--", alpha=0.5)
-trend1.pyplot(fig_t1)
+    cleaned_input = pd.DataFrame({name: pd.Series(data) for name, data in datasets.items()})
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df_results.to_excel(writer, index=False, sheet_name="results")
+        cleaned_input.to_excel(writer, index=False, sheet_name="cleaned_input")
 
-fig_t2, ax_t2 = plt.subplots(figsize=(6, 4))
-ax_t2.plot(future_times, fail_trend)
-ax_t2.axvline(t_current, linestyle="--")
-ax_t2.set_title("Failure Probability Growth")
-ax_t2.set_xlabel("Time")
-ax_t2.set_ylabel("Probability")
-ax_t2.grid(True, linestyle="--", alpha=0.5)
-trend2.pyplot(fig_t2)
+    st.download_button(
+        "Download Analysis Workbook",
+        buffer.getvalue(),
+        "weibull_analysis.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
-fig_t3, ax_t3 = plt.subplots(figsize=(6, 4))
-ax_t3.plot(future_times, haz_trend)
-ax_t3.axvline(t_current, linestyle="--")
-ax_t3.set_title("Hazard Rate Trend")
-ax_t3.set_xlabel("Time")
-ax_t3.set_ylabel("Failure Rate")
-ax_t3.grid(True, linestyle="--", alpha=0.5)
-trend3.pyplot(fig_t3)
-
-future_failure_at_horizon = float(fail_trend[-1])
-
-st.subheader("🔮 Future Risk Insight")
-if future_failure_at_horizon >= 0.70:
-    st.error(f"🚨 Very High Risk within the next {prediction_horizon} cycles: {fmt_pct(future_failure_at_horizon)}")
-elif future_failure_at_horizon >= 0.40:
-    st.warning(f"⚠️ Moderate Risk within the next {prediction_horizon} cycles: {fmt_pct(future_failure_at_horizon)}")
-else:
-    st.success(f"✅ Low Risk within the next {prediction_horizon} cycles: {fmt_pct(future_failure_at_horizon)}")
-
-st.caption("Failure probability is displayed as a percentage everywhere in the dashboard.")
+st.caption("All future risk metrics are conditional on surviving to the current in-service time.")
