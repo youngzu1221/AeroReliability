@@ -863,7 +863,7 @@ def plot_distribution_fit(
     ax_haz.plot(hazard_range, haz_curve, label="Hazard rate")
     ax_haz.set_title("Hazard Function (Failure Rate)")
     ax_haz.set_xlabel("Time")
-    ax_haz.set_ylabel("Failure rate (per hour or Cycle)")
+    ax_haz.set_ylabel("Failure rate (per hour), not probability")
     apply_axis_bounds_and_units(ax_haz, haz_axis_config, (haz_x_low, haz_x_high), (haz_y_low, haz_y_high))
     ax_haz.grid(True, linestyle="--", alpha=0.45)
     ax_haz.legend()
