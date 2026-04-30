@@ -53,6 +53,7 @@ class WeibullResult:
     min_cost_rate: float
     failure_mode: str
     risk: str
+    decision: str
 
 
 # ============================================================
@@ -87,6 +88,40 @@ def weibull_cdf(t: np.ndarray | float, beta: float, eta: float) -> np.ndarray:
 def weibull_quantile(probability: float, beta: float, eta: float) -> float:
     p = float(np.clip(probability, EPS, 1.0 - EPS))
     return float(eta * (-np.log(1.0 - p)) ** (1.0 / beta))
+
+
+def conditional_reliability_between(start_time: float, end_time: float, beta: float, eta: float) -> float:
+    start_rel = float(reliability(start_time, beta, eta))
+    if start_rel <= EPS:
+        return 0.0
+    end_rel = float(reliability(end_time, beta, eta))
+    return float(np.clip(end_rel / start_rel, 0.0, 1.0))
+
+
+def conditional_failure_probability_between(start_time: float, end_time: float, beta: float, eta: float) -> float:
+    return float(np.clip(1.0 - conditional_reliability_between(start_time, end_time, beta, eta), 0.0, 1.0))
+
+
+def expected_remaining_life(current_age: float, beta: float, eta: float) -> float:
+    current_age = max(float(current_age), 0.0)
+    survival_now = float(reliability(current_age, beta, eta))
+    if survival_now <= EPS:
+        return 0.0
+
+    upper = max(
+        current_age + 10.0 * eta,
+        weibull_quantile(0.999999, beta, eta),
+        current_age + 1.0,
+    )
+    upper = max(upper, current_age + EPS)
+    grid = np.linspace(current_age, upper, 4000)
+    surv = reliability(grid, beta, eta)
+    trapezoid = getattr(np, "trapezoid", None)
+    if trapezoid is not None:
+        area = float(trapezoid(surv, grid))
+    else:
+        area = float(np.trapz(surv, grid))
+    return max(0.0, area / survival_now)
 
 
 def neg_log_likelihood(params: np.ndarray, data: np.ndarray) -> float:
@@ -132,19 +167,20 @@ def cost_based_optimal_replacement(
     failure_cost: float,
 ) -> tuple[float, float, np.ndarray, np.ndarray]:
     start = max(EPS, float(np.min(data) * 0.25))
-    end = max(float(np.max(data) * 2.0), start + 1.0)
-    t_range = np.linspace(start, end, 1000)
-    cost_rate = (preventive_cost + failure_cost * weibull_cdf(t_range, beta, eta)) / t_range
+    end = max(float(np.max(data) * 3.0), eta * 4.0, start + 1.0)
+    t_range = np.linspace(start, end, 1600)
+
+    t_full = np.concatenate(([0.0], t_range))
+    survival_full = reliability(t_full, beta, eta)
+    cumulative_survival = np.concatenate(
+        ([0.0], np.cumsum((survival_full[:-1] + survival_full[1:]) * 0.5 * np.diff(t_full)))
+    )[1:]
+    survival = survival_full[1:]
+    expected_cycle_cost = preventive_cost * survival + failure_cost * (1.0 - survival)
+    cost_rate = expected_cycle_cost / np.maximum(cumulative_survival, EPS)
     idx = int(np.argmin(cost_rate))
     return float(t_range[idx]), float(cost_rate[idx]), t_range, cost_rate
 
-
-def failure_mode_from_beta(beta: float) -> str:
-    if beta < 0.95:
-        return "Infant mortality"
-    if beta <= 1.05:
-        return "Random failure"
-    return "Wear-out"
 
 
 def risk_label(probability: float) -> str:
@@ -153,6 +189,33 @@ def risk_label(probability: float) -> str:
     if probability >= RISK_THRESHOLDS["medium"]:
         return "MEDIUM"
     return "LOW"
+
+
+def failure_mode_from_beta(beta: float) -> str:
+    if beta < 0.95:
+        return "Infant mortality"
+    if beta <= 1.05:
+        return "Random failure"
+    if beta < 3.0:
+        return "Wear-out"
+    return "Wear-out (sudden failure)"
+
+
+def decision_from_metrics(
+    current_age: float,
+    optimal_replacement: float,
+    conditional_failure_probability: float,
+    beta: float,
+) -> str:
+    if current_age >= optimal_replacement or conditional_failure_probability >= 0.70:
+        return "OVERDUE"
+    if conditional_failure_probability >= 0.35:
+        return "PLAN REPLACEMENT"
+    if beta >= 5.0 and current_age >= 0.75 * optimal_replacement:
+        return "PLAN REPLACEMENT"
+    if current_age >= 0.90 * optimal_replacement:
+        return "PLAN REPLACEMENT"
+    return "SAFE"
 
 
 def fmt_pct(value: float) -> str:
@@ -414,8 +477,7 @@ def analyze_component(
 
     current_rel = float(reliability(current_age, beta, eta))
     mission_rel = float(reliability(current_age + mission_time, beta, eta))
-    conditional_rel = mission_rel / current_rel if current_rel > EPS else 0.0
-    conditional_rel = float(np.clip(conditional_rel, 0.0, 1.0))
+    conditional_rel = conditional_reliability_between(current_age, current_age + mission_time, beta, eta)
     conditional_fail = float(np.clip(1.0 - conditional_rel, 0.0, 1.0))
 
     optimal_replacement, min_cost_rate, _, _ = cost_based_optimal_replacement(
@@ -425,6 +487,9 @@ def analyze_component(
         preventive_cost,
         failure_cost,
     )
+
+    rul = expected_remaining_life(current_age, beta, eta)
+    decision = decision_from_metrics(current_age, optimal_replacement, conditional_fail, beta)
 
     return WeibullResult(
         component=component,
@@ -437,11 +502,12 @@ def analyze_component(
         mission_reliability=mission_rel,
         conditional_reliability=conditional_rel,
         conditional_failure_probability=conditional_fail,
-        rul=float(mttf - current_age),
+        rul=max(0.0, rul),
         optimal_replacement=optimal_replacement,
         min_cost_rate=min_cost_rate,
         failure_mode=failure_mode_from_beta(beta),
         risk=risk_label(conditional_fail),
+        decision=decision,
     )
 
 
@@ -462,6 +528,7 @@ def results_to_frame(results: dict[str, WeibullResult]) -> pd.DataFrame:
                 "Min Cost Rate": result.min_cost_rate,
                 "Failure Mode": result.failure_mode,
                 "Risk": result.risk,
+                "Decision": result.decision,
             }
         )
     return (
@@ -617,7 +684,7 @@ def build_component_deep_dive_pdf(
         pdf.savefig(fig, bbox_inches="tight")
         plt.close(fig)
 
-        distribution_fig = build_distribution_fit_figure(result, adjustment_target, x_pad, y_pad, axis_config, for_pdf=True)
+        distribution_fig = build_distribution_fit_figure(result, current_age, adjustment_target, x_pad, y_pad, axis_config, for_pdf=True)
         pdf.savefig(distribution_fig, bbox_inches="tight")
         plt.close(distribution_fig)
 
@@ -695,7 +762,7 @@ def build_reliability_report_pdf(
         pdf.savefig(fig, bbox_inches="tight")
         plt.close(fig)
 
-        distribution_fig = build_distribution_fit_figure(result, adjustment_target, x_pad, y_pad, axis_config, for_pdf=True)
+        distribution_fig = build_distribution_fit_figure(result, current_age, adjustment_target, x_pad, y_pad, axis_config, for_pdf=True)
         pdf.savefig(distribution_fig, bbox_inches="tight")
         plt.close(distribution_fig)
 
@@ -716,6 +783,7 @@ def build_reliability_report_pdf(
 # ============================================================
 def plot_distribution_fit(
     result: WeibullResult,
+    current_age: float,
     adjustment_target: str,
     x_pad: float,
     y_pad: float,
@@ -763,8 +831,11 @@ def plot_distribution_fit(
     col_pdf, col_cdf = st.columns(2)
 
     fig_pdf, ax_pdf = plt.subplots(figsize=(8, 4))
-    ax_pdf.plot(distribution_range, pdf_curve, label="MLE model")
+    ax_pdf.plot(distribution_range, pdf_curve, label="Weibull fit")
     ax_pdf.scatter(data, pdf_points, s=28, label="Observations", clip_on=False)
+    ax_pdf.axvline(eta, color="crimson", linestyle="--", alpha=0.75, label="η characteristic life")
+    if current_age > 0:
+        ax_pdf.axvline(current_age, color="black", linestyle=":", alpha=0.7, label="Current time")
     ax_pdf.set_title("PDF")
     ax_pdf.set_xlabel("Time")
     ax_pdf.set_ylabel("Density")
@@ -774,8 +845,11 @@ def plot_distribution_fit(
     col_pdf.pyplot(fig_pdf, clear_figure=True)
 
     fig_cdf, ax_cdf = plt.subplots(figsize=(8, 4))
-    ax_cdf.plot(distribution_range, cdf_curve, label="MLE model")
+    ax_cdf.plot(distribution_range, cdf_curve, label="Weibull fit")
     ax_cdf.scatter(data, median_ranks, s=28, label="Median ranks", clip_on=False)
+    ax_cdf.axvline(eta, color="crimson", linestyle="--", alpha=0.75, label="η characteristic life")
+    if current_age > 0:
+        ax_cdf.axvline(current_age, color="black", linestyle=":", alpha=0.7, label="Current time")
     ax_cdf.set_title("CDF / Unreliability")
     ax_cdf.set_xlabel("Time")
     ax_cdf.set_ylabel("Probability")
@@ -787,9 +861,9 @@ def plot_distribution_fit(
 
     fig_haz, ax_haz = plt.subplots(figsize=(9, 3.2))
     ax_haz.plot(hazard_range, haz_curve, label="Hazard rate")
-    ax_haz.set_title("Hazard Function")
+    ax_haz.set_title("Hazard Function (Failure Rate)")
     ax_haz.set_xlabel("Time")
-    ax_haz.set_ylabel("Failure rate")
+    ax_haz.set_ylabel("Failure rate (per hour), not probability")
     apply_axis_bounds_and_units(ax_haz, haz_axis_config, (haz_x_low, haz_x_high), (haz_y_low, haz_y_high))
     ax_haz.grid(True, linestyle="--", alpha=0.45)
     ax_haz.legend()
@@ -808,6 +882,7 @@ def plot_forward_risk(
 ) -> None:
     beta = result.beta
     eta = result.eta
+    optimal_replacement = result.optimal_replacement
     requested_horizon = max(float(horizon), 0.0)
     plot_horizon = max(requested_horizon, 1.0)
     future_times = np.linspace(max(EPS, current_age), current_age + plot_horizon, 250)
@@ -818,10 +893,14 @@ def plot_forward_risk(
         conditional_fail = np.zeros_like(future_times)
         haz = np.full_like(future_times, float(hazard(current_age, beta, eta)))
     else:
-        rel = reliability(future_times, beta, eta)
-        conditional_rel = rel / current_rel if current_rel > EPS else np.zeros_like(rel)
-        conditional_rel = np.clip(conditional_rel, 0.0, 1.0)
-        conditional_fail = 1.0 - conditional_rel
+        conditional_rel = np.array(
+            [conditional_reliability_between(current_age, t, beta, eta) for t in future_times],
+            dtype=float,
+        )
+        conditional_fail = np.array(
+            [conditional_failure_probability_between(current_age, t, beta, eta) for t in future_times],
+            dtype=float,
+        )
         haz = hazard(future_times, beta, eta)
 
     rel_x_pad, rel_y_pad = plot_padding(adjustment_target, "Conditional Reliability", x_pad, y_pad)
@@ -839,8 +918,10 @@ def plot_forward_risk(
     col_rel, col_fail, col_haz = st.columns(3)
 
     fig_rel, ax_rel = plt.subplots(figsize=(6, 4))
-    ax_rel.plot(future_times, conditional_rel)
-    ax_rel.axvline(current_age, color="black", linestyle="--", alpha=0.65)
+    ax_rel.plot(future_times, conditional_rel, label="Conditional reliability")
+    ax_rel.axvline(current_age, color="black", linestyle="--", alpha=0.65, label="Current time")
+    ax_rel.axvline(optimal_replacement, color="crimson", linestyle=":", alpha=0.75, label="Optimal replacement")
+    ax_rel.axvline(eta, color="purple", linestyle="-.", alpha=0.7, label="η characteristic life")
     ax_rel.set_title("Conditional Reliability")
     ax_rel.set_xlabel("Time")
     ax_rel.set_ylabel("Reliability")
@@ -850,8 +931,10 @@ def plot_forward_risk(
     col_rel.pyplot(fig_rel, clear_figure=True)
 
     fig_fail, ax_fail = plt.subplots(figsize=(6, 4))
-    ax_fail.plot(future_times, conditional_fail)
-    ax_fail.axvline(current_age, color="black", linestyle="--", alpha=0.65)
+    ax_fail.plot(future_times, conditional_fail, label="P(fail in mission)")
+    ax_fail.axvline(current_age, color="black", linestyle="--", alpha=0.65, label="Current time")
+    ax_fail.axvline(optimal_replacement, color="crimson", linestyle=":", alpha=0.75, label="Optimal replacement")
+    ax_fail.axvline(eta, color="purple", linestyle="-.", alpha=0.7, label="η characteristic life")
     ax_fail.set_title("Conditional Failure Probability")
     ax_fail.set_xlabel("Time")
     ax_fail.set_ylabel("Probability")
@@ -865,9 +948,11 @@ def plot_forward_risk(
     ax_haz.axvline(current_age, color="black", linestyle="--", alpha=0.65)
     ax_haz.set_title("Hazard Trend")
     ax_haz.set_xlabel("Time")
-    ax_haz.set_ylabel("Failure rate")
+    ax_haz.set_ylabel("Failure rate (per hour), not probability")
     apply_axis_bounds_and_units(ax_haz, haz_axis_config, (haz_x_low, haz_x_high), (haz_y_low, haz_y_high))
     ax_haz.grid(True, linestyle="--", alpha=0.45)
+    ax_haz.legend(fontsize=8)
+    ax_haz.tick_params(axis="y", labelleft=True, pad=4)
     col_haz.pyplot(fig_haz, clear_figure=True)
 
     horizon_failure = float(conditional_fail[-1])
@@ -915,6 +1000,7 @@ def plot_cost_curve(
 
 def build_distribution_fit_figure(
     result: WeibullResult,
+    current_age: float,
     adjustment_target: str,
     x_pad: float,
     y_pad: float,
@@ -970,17 +1056,22 @@ def build_distribution_fit_figure(
     ax_cdf = fig.add_subplot(grid[0, 1])
     ax_haz = fig.add_subplot(grid[1, :])
 
-    ax_pdf.plot(distribution_range, pdf_curve, label="MLE model")
+    ax_pdf.plot(distribution_range, pdf_curve, label="Weibull fit")
     ax_pdf.scatter(data, pdf_points, s=22, label="Observations", clip_on=False)
+    ax_pdf.axvline(eta, color="crimson", linestyle="--", alpha=0.75, label="η characteristic life")
+    ax_pdf.axvline(current_age, color="black", linestyle=":", alpha=0.7, label="Current time")
     ax_pdf.set_title("PDF")
     ax_pdf.set_xlabel("Time")
     ax_pdf.set_ylabel("Density")
     apply_axis_bounds_and_units(ax_pdf, pdf_axis_config, (pdf_x_low, pdf_x_high), (pdf_y_low, pdf_y_high))
     ax_pdf.grid(True, linestyle="--", alpha=0.45)
     ax_pdf.legend(fontsize=8)
+    ax_pdf.tick_params(axis="y", labelleft=True, pad=4)
 
-    ax_cdf.plot(distribution_range, cdf_curve, label="MLE model")
+    ax_cdf.plot(distribution_range, cdf_curve, label="Weibull fit")
     ax_cdf.scatter(data, median_ranks, s=22, label="Median ranks", clip_on=False)
+    ax_cdf.axvline(eta, color="crimson", linestyle="--", alpha=0.75, label="η characteristic life")
+    ax_cdf.axvline(current_age, color="black", linestyle=":", alpha=0.7, label="Current time")
     ax_cdf.set_title("CDF / Unreliability")
     ax_cdf.set_xlabel("Time")
     ax_cdf.set_ylabel("Probability")
@@ -988,11 +1079,12 @@ def build_distribution_fit_figure(
     apply_axis_bounds_and_units(ax_cdf, cdf_axis_config, (cdf_x_low, cdf_x_high), (-cdf_y_margin, 1.0 + cdf_y_margin))
     ax_cdf.grid(True, linestyle="--", alpha=0.45)
     ax_cdf.legend(fontsize=8)
+    ax_cdf.tick_params(axis="y", labelleft=True, pad=4)
 
     ax_haz.plot(hazard_range, haz_curve, label="Hazard rate")
-    ax_haz.set_title("Hazard Function")
+    ax_haz.set_title("Hazard Function (Failure Rate)")
     ax_haz.set_xlabel("Time")
-    ax_haz.set_ylabel("Failure rate")
+    ax_haz.set_ylabel("Failure rate (per hour), not probability")
     apply_axis_bounds_and_units(ax_haz, haz_axis_config, (haz_x_low, haz_x_high), (haz_y_low, haz_y_high))
     ax_haz.grid(True, linestyle="--", alpha=0.45)
     ax_haz.legend(fontsize=8)
@@ -1012,6 +1104,7 @@ def build_forward_risk_figure(
 ) -> plt.Figure:
     beta = result.beta
     eta = result.eta
+    optimal_replacement = result.optimal_replacement
     requested_horizon = max(float(horizon), 0.0)
     plot_horizon = max(requested_horizon, 1.0)
     future_times = np.linspace(max(EPS, current_age), current_age + plot_horizon, 250)
@@ -1022,10 +1115,14 @@ def build_forward_risk_figure(
         conditional_fail = np.zeros_like(future_times)
         haz = np.full_like(future_times, float(hazard(current_age, beta, eta)))
     else:
-        rel = reliability(future_times, beta, eta)
-        conditional_rel = rel / current_rel if current_rel > EPS else np.zeros_like(rel)
-        conditional_rel = np.clip(conditional_rel, 0.0, 1.0)
-        conditional_fail = 1.0 - conditional_rel
+        conditional_rel = np.array(
+            [conditional_reliability_between(current_age, t, beta, eta) for t in future_times],
+            dtype=float,
+        )
+        conditional_fail = np.array(
+            [conditional_failure_probability_between(current_age, t, beta, eta) for t in future_times],
+            dtype=float,
+        )
         haz = hazard(future_times, beta, eta)
 
     rel_x_pad, rel_y_pad = plot_padding(adjustment_target, "Conditional Reliability", x_pad, y_pad)
@@ -1070,6 +1167,7 @@ def build_forward_risk_figure(
 
     fig.suptitle(f"Forward Risk Trend - {result.component}", fontsize=14, fontweight="bold")
     fig.tight_layout()
+    fig.subplots_adjust(left=0.10)
     return fig
 
 
@@ -1096,15 +1194,19 @@ def build_cost_curve_figure(
     y_low, y_high = axis_limits_with_margin(float(cost_rate.min()), float(cost_rate.max()), cost_y_pad, margin=0.04)
 
     fig, ax = plt.subplots(figsize=(11.7, 4.2))
-    ax.plot(t_range, cost_rate)
+    ax.plot(t_range, cost_rate, label="Cost rate")
     ax.axvline(result.optimal_replacement, color="crimson", linestyle="--", label="Optimal replacement")
+    ax.axvline(result.eta, color="purple", linestyle=":", label="η characteristic life")
+    ax.axvline(result.rul, color="black", linestyle="-.", label="RUL")
     ax.set_title(f"Replacement Economics - {result.component}")
     ax.set_xlabel("Replacement time")
     ax.set_ylabel("Expected cost rate ($/time)")
     apply_axis_bounds_and_units(ax, cost_axis_config, (x_low, x_high), (y_low, y_high))
     ax.grid(True, linestyle="--", alpha=0.45)
     ax.legend()
+    ax.tick_params(axis="y", labelleft=True, pad=4)
     fig.tight_layout()
+    fig.subplots_adjust(left=0.10)
     return fig
 
 
@@ -1118,9 +1220,9 @@ with st.sidebar:
     st.header("Inputs")
     mttr = st.number_input("MTTR", min_value=0.0, value=0.0, step=1.0)
     current_age = st.number_input("Current in-service time", min_value=0.0, value=0.0, step=100.0)
-    mission_time = st.number_input("Future mission/runtime", min_value=0.0, value=100.0, step=100.0)
-    preventive_cost = st.number_input("Preventive cost (Cp) $", min_value=0.0, value=500.0, step=100.0)
-    failure_cost = st.number_input("Failure cost (Cf) $", min_value=0.0, value=5000.0, step=500.0)
+    mission_time = st.number_input("Future mission/runtime", min_value=0.0, value=0.0, step=100.0)
+    preventive_cost = st.number_input("Preventive cost (Cp) $", min_value=0.0, value=0.0, step=100.0)
+    failure_cost = st.number_input("Failure cost (Cf) $", min_value=0.0, value=0.0, step=500.0)
     prediction_horizon = st.slider("Prediction horizon", 0, 10000, 0, 100)
 
     st.divider()
@@ -1137,12 +1239,17 @@ with st.sidebar:
     x_pad = adjustment_control("Horizontal adjustment", "axis_x_pad")
     y_pad = adjustment_control("Vertical adjustment", "axis_y_pad")
     axis_config = axis_bounds_and_units_control()
+    if st.button("Reset axis bounds and units"):
+        reset_active_axis_adjustment()
+        st.rerun()
 
     st.divider()
     st.markdown("**Beta interpretation**")
+    st.markdown("**Hazard interpretation:** failure rate (per hour), not probability")
     st.markdown("- Beta < 0.95: infant mortality")
     st.markdown("- 0.95 to 1.05: random failure")
     st.markdown("- Beta > 1.05: wear-out")
+    st.markdown("- High beta: sudden failure tendency")
 
 
 template_col, upload_col = st.columns([1, 2])
@@ -1240,13 +1347,14 @@ with detail_tab:
     m5.metric("Min Cost Rate", fmt_money(result.min_cost_rate))
 
     st.metric("Conditional Reliability", fmt_pct(result.conditional_reliability))
+    st.metric("Decision", result.decision)
 
-    if result.risk == "HIGH":
-        st.error(f"Immediate maintenance planning is recommended before about {result.optimal_replacement:,.2f}.")
-    elif result.risk == "MEDIUM":
-        st.warning(f"Schedule maintenance soon. Recommended replacement around {result.optimal_replacement:,.2f}.")
+    if result.decision == "OVERDUE":
+        st.error(f"OVERDUE: replacement should happen now or at the next available maintenance stop.")
+    elif result.decision == "PLAN REPLACEMENT":
+        st.warning(f"PLAN REPLACEMENT: recommended around {result.optimal_replacement:,.2f}.")
     else:
-        st.success(f"Continue monitoring. Recommended replacement around {result.optimal_replacement:,.2f}.")
+        st.success(f"SAFE: continue monitoring. Recommended replacement around {result.optimal_replacement:,.2f}.")
 
     q10, q50, q90 = (
         weibull_quantile(0.10, result.beta, result.eta),
@@ -1256,7 +1364,7 @@ with detail_tab:
     st.info(f"B10 life: {q10:,.2f} | Median life: {q50:,.2f} | B90 life: {q90:,.2f}")
 
     st.subheader("Distribution Fit")
-    plot_distribution_fit(result, adjustment_target, x_pad, y_pad, axis_config)
+    plot_distribution_fit(result, current_age, adjustment_target, x_pad, y_pad, axis_config)
 
     st.subheader("Forward Risk Trend")
     plot_forward_risk(result, current_age, prediction_horizon, adjustment_target, x_pad, y_pad, axis_config)
@@ -1304,4 +1412,4 @@ with export_tab:
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-st.caption("All future risk metrics are conditional on surviving to the current in-service time.")
+st.caption("All future risk metrics use conditional reliability: P(fail in mission)=1−R(t+Δt)/R(t).")
