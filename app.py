@@ -1245,12 +1245,11 @@ with st.sidebar:
 
     st.divider()
     st.markdown("**Beta interpretation**")
-    st.markdown("**Hazard interpretation:** failure rate (per hour), not probability")
     st.markdown("- Beta < 0.95: infant mortality")
     st.markdown("- 0.95 to 1.05: random failure")
     st.markdown("- Beta > 1.05: wear-out")
     st.markdown("- High beta: sudden failure tendency")
-
+    st.markdown("**Hazard interpretation:** failure rate (per hour), not probability")
 
 template_col, upload_col = st.columns([1, 2])
 with template_col:
