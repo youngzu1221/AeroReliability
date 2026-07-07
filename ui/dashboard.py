@@ -101,10 +101,10 @@ def build_report_cached(
 
 
 def render_dashboard() -> None:
-    st.set_page_config(page_title="Reliability & Weibull Pro Dashboard", page_icon="R", layout="wide")
+    st.set_page_config(page_title="Reliability Dashboard", page_icon="R", layout="wide")
     title_col, logo_col = st.columns([5.0, 1.7])
     with title_col:
-        st.title("Reliability & Weibull Predictive Dashboard Pro")
+        st.title("Reliability Dashboard")
         st.caption("Upload an Excel workbook where each column is one component and each value is a positive failure/runtime observation.")
     with logo_col:
         if LOGO_PATH.exists():
