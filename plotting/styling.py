@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import math
-
 from matplotlib.ticker import MultipleLocator
 
 PLOT_ADJUSTMENT_TARGETS = [
@@ -28,26 +26,6 @@ def axis_limits_with_margin(low: float, high: float, pad: float, margin: float =
     return axis_limits(low, high, pad + margin)
 
 
-def nice_major_unit(span: float, target_ticks: int = 8) -> float:
-    safe_span = max(float(span), 1e-9)
-    raw = safe_span / max(int(target_ticks), 1)
-    exponent = math.floor(math.log10(raw))
-    fraction = raw / (10.0 ** exponent)
-
-    if fraction < 1.5:
-        nice_fraction = 1.0
-    elif fraction < 3.0:
-        nice_fraction = 2.0
-    elif fraction < 4.0:
-        nice_fraction = 2.5
-    elif fraction < 7.0:
-        nice_fraction = 5.0
-    else:
-        nice_fraction = 10.0
-
-    return nice_fraction * (10.0 ** exponent)
-
-
 def plot_padding(target: str, plot_name: str, x_pad: float, y_pad: float) -> tuple[float, float]:
     if target == "All plots" or target == plot_name:
         return x_pad, y_pad
@@ -60,14 +38,6 @@ def plot_axis_config(target: str, plot_name: str, axis_config: dict[str, float |
     return {}
 
 
-def _safe_limit_pair(low: float, high: float, default: tuple[float, float]) -> tuple[float, float]:
-    safe_low = float(low) if math.isfinite(float(low)) else float(default[0])
-    safe_high = float(high) if math.isfinite(float(high)) else float(default[1])
-    if safe_high <= safe_low:
-        return float(default[0]), float(default[1])
-    return safe_low, safe_high
-
-
 def apply_axis_bounds_and_units(
     ax,
     axis_config: dict[str, float | bool],
@@ -76,8 +46,6 @@ def apply_axis_bounds_and_units(
 ) -> None:
     x_low, x_high = x_limits
     y_low, y_high = y_limits
-    x_low, x_high = _safe_limit_pair(x_low, x_high, (0.0, 1.0))
-    y_low, y_high = _safe_limit_pair(y_low, y_high, (0.0, 1.0))
 
     if axis_config.get("use_x_bounds"):
         configured_min = float(axis_config.get("x_min", x_low))
@@ -90,9 +58,6 @@ def apply_axis_bounds_and_units(
         configured_max = float(axis_config.get("y_max", y_high))
         if configured_max > configured_min:
             y_low, y_high = configured_min, configured_max
-
-    x_low, x_high = _safe_limit_pair(x_low, x_high, (0.0, 1.0))
-    y_low, y_high = _safe_limit_pair(y_low, y_high, (0.0, 1.0))
 
     ax.set_xlim(x_low, x_high)
     ax.set_ylim(y_low, y_high)

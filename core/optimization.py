@@ -55,15 +55,12 @@ def optimization_starts(data: np.ndarray) -> list[np.ndarray]:
 
 
 def estimate_weibull_mle(data: np.ndarray) -> tuple[float, float]:
-    cleaned = np.asarray(data, dtype=float)
-    cleaned = cleaned[np.isfinite(cleaned)]
-    cleaned = cleaned[cleaned > 0.0]
-    cleaned = np.sort(cleaned)
-
-    if len(cleaned) < 2:
+    if len(data) < 2:
         raise ValueError("Need at least 2 valid positive observations.")
 
-    candidates: list[np.ndarray] = []
+    cleaned = np.asarray(data, dtype=float)
+    best_result = None
+    best_score = float("inf")
 
     for start in optimization_starts(cleaned):
         result = minimize(
@@ -72,20 +69,12 @@ def estimate_weibull_mle(data: np.ndarray) -> tuple[float, float]:
             args=(cleaned,),
             method="L-BFGS-B",
             bounds=[(1e-6, None), (1e-6, None)],
-            options={"ftol": 1e-12, "gtol": 1e-10, "maxiter": 20000},
         )
-        if result.success and np.all(np.isfinite(result.x)):
-            candidates.append(np.asarray(result.x, dtype=float))
+        if result.success and float(result.fun) < best_score:
+            best_result = result
+            best_score = float(result.fun)
 
-    try:
-        scipy_shape, _, scipy_scale = stats.weibull_min.fit(cleaned, floc=0.0)
-        scipy_candidate = np.asarray([scipy_shape, scipy_scale], dtype=float)
-        if np.all(np.isfinite(scipy_candidate)) and np.all(scipy_candidate > 0.0):
-            candidates.append(scipy_candidate)
-    except Exception:
-        pass
-
-    if not candidates:
+    if best_result is None:
         fallback = minimize(
             neg_log_likelihood,
             x0=np.array([1.5, max(float(np.mean(cleaned)), EPS)]),
@@ -95,10 +84,9 @@ def estimate_weibull_mle(data: np.ndarray) -> tuple[float, float]:
         )
         if not fallback.success:
             raise RuntimeError("Weibull parameter estimation failed for this dataset.")
-        candidates.append(np.asarray(fallback.x, dtype=float))
+        best_result = fallback
 
-    best_params = min(candidates, key=lambda params: float(neg_log_likelihood(np.asarray(params, dtype=float), cleaned)))
-    beta, eta = best_params
+    beta, eta = best_result.x
     return float(beta), float(eta)
 
 

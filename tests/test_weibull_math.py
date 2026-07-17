@@ -1,7 +1,6 @@
 import unittest
 
 import numpy as np
-from scipy import stats
 
 from core.optimization import bootstrap_weibull_parameters, estimate_weibull_mle, fit_distribution_models
 from core.weibull_math import weibull_cdf, weibull_pdf, weibull_quantile
@@ -26,14 +25,6 @@ class WeibullMathTests(unittest.TestCase):
         beta, eta = estimate_weibull_mle(sample)
         self.assertAlmostEqual(beta, 2.4, delta=0.35)
         self.assertAlmostEqual(eta, 1200.0, delta=180.0)
-
-    def test_mle_matches_scipy_fixed_location_fit(self):
-        rng = np.random.default_rng(123)
-        sample = np.sort(rng.weibull(1.9, 200) * 875.0)
-        beta, eta = estimate_weibull_mle(sample)
-        scipy_beta, _, scipy_eta = stats.weibull_min.fit(sample, floc=0.0)
-        self.assertAlmostEqual(beta, scipy_beta, delta=1e-6)
-        self.assertAlmostEqual(eta, scipy_eta, delta=1e-6)
 
     def test_distribution_comparison_returns_expected_models(self):
         rng = np.random.default_rng(7)

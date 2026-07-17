@@ -40,17 +40,6 @@ def distribution_parameter_text(fit: DistributionFit) -> str:
     )
 
 
-def _parameter_cell(label, value) -> str:
-    if label is None or pd.isna(label):
-        return ""
-    label_text = str(label).strip()
-    if not label_text:
-        return ""
-    if value is None or not np.isfinite(float(value)):
-        return label_text
-    return f"{label_text} = {fmt_num(float(value), 3)}"
-
-
 def formatted_results_frame(df: pd.DataFrame) -> pd.DataFrame:
     display_df = df.copy()
 
@@ -118,30 +107,6 @@ def formatted_results_frame(df: pd.DataFrame) -> pd.DataFrame:
     return display_df
 
 
-def fleet_summary_table_frame(df: pd.DataFrame) -> pd.DataFrame:
-    rows = []
-    for _, row in df.iterrows():
-        rows.append(
-            {
-                "Component": str(row["Component"]),
-                "Distribution": str(row["Selected Distribution"]),
-                "Characteristic Value": float(row["Characteristic Value"]),
-                "MTTF": float(row["MTTF"]),
-                "MTBF": float(row["MTBF"]),
-                "Conditional Reliability": float(row["Conditional Reliability"]) * 100.0,
-                "Failure Probability": float(row["Conditional Probability of Failure"]) * 100.0,
-                "RUL": float(row["RUL"]),
-                "Optimal Replacement": float(row["Optimal Replacement"]),
-                "Min Cost Rate": float(row["Min Cost Rate"]),
-                "Failure Mode": str(row["Failure Mode"]),
-                "Risk": str(row["Risk"]),
-                "RPN": int(round(float(row["RPN"]))),
-            }
-        )
-
-    return pd.DataFrame(rows)
-
-
 def distribution_comparison_frame(distribution_fits: tuple[DistributionFit, ...]) -> pd.DataFrame:
     rows = []
     for rank, fit in enumerate(distribution_fits, start=1):
@@ -151,14 +116,14 @@ def distribution_comparison_frame(distribution_fits: tuple[DistributionFit, ...]
                 "Distribution": fit.name,
                 "Parameters": distribution_parameter_text(fit),
                 "Best Fit": "YES" if rank == 1 else "NO",
-                "R^2": fmt_pct(fit.fit_score),
+                "Fit % (R^2-like)": fmt_pct(fit.fit_score),
                 "AIC": fmt_num(fit.aic),
                 "BIC": fmt_num(fit.bic),
                 "RMSE": fmt_num(fit.rmse, 4),
                 "KS Statistic": fmt_num(fit.ks_statistic, 4),
-                "KS P-Value": fmt_num(fit.ks_pvalue, 4),
+                "KS p-value": fmt_num(fit.ks_pvalue, 4),
                 "AD Statistic": fmt_num(fit.ad_statistic, 4),
-                "AD P-Value": fmt_num(fit.ad_pvalue, 4),
+                "AD p-value": fmt_num(fit.ad_pvalue, 4),
             }
         )
     return pd.DataFrame(rows)
@@ -201,11 +166,6 @@ def metric_descriptions_frame() -> pd.DataFrame:
                 "Term": "Characteristic value",
                 "Meaning": "The 63.2% life point from the selected distribution.",
                 "Why it matters": "For Weibull this equals eta, and for the other models it gives a comparable reference life marker.",
-            },
-            {
-                "Term": "Weibull Beta",
-                "Meaning": "The Weibull shape parameter from the reference Weibull MLE fit.",
-                "Why it matters": "It tells you whether failures are dominated by infant mortality, random behavior, or wear-out.",
             },
             {
                 "Term": "RPN",
@@ -278,12 +238,12 @@ def fit_stat_descriptions_frame() -> pd.DataFrame:
             {
                 "Statistic": "AIC",
                 "Meaning": "Akaike Information Criterion. Lower is better.",
-                "How to read it": "Rewards fit quality but penalizes unnecessary complexity, so it helps you compare models fairly.",
+                "How to read it": "Rewards fit quality but penalizes unnecessary complexity.",
             },
             {
                 "Statistic": "BIC",
                 "Meaning": "Bayesian Information Criterion. Lower is better.",
-                "How to read it": "Penalizes extra complexity more strongly than AIC, so it tends to prefer simpler models when the fit is close.",
+                "How to read it": "Penalizes extra complexity more strongly than AIC.",
             },
             {
                 "Statistic": "RMSE",
@@ -291,29 +251,19 @@ def fit_stat_descriptions_frame() -> pd.DataFrame:
                 "How to read it": "Lower means the fitted distribution sits closer to the observed probability pattern.",
             },
             {
-                "Statistic": "KS Statistic",
-                "Meaning": "Kolmogorov-Smirnov test statistic, based on the largest gap between the empirical and fitted CDF.",
-                "How to read it": "Lower is better because it means the fitted curve stays closer to the observed data across the range.",
+                "Statistic": "Fit % (R^2-like)",
+                "Meaning": "A bounded fit score derived from the same empirical-vs-fitted CDF comparison.",
+                "How to read it": "Higher is better; it behaves like an easy-to-read fit percentage rather than a literal regression R^2.",
             },
             {
-                "Statistic": "KS P-Value",
-                "Meaning": "Kolmogorov-Smirnov p-value for the fitted distribution.",
-                "How to read it": "Higher is usually better because it means the observed differences are less surprising under the fitted model.",
+                "Statistic": "KS test",
+                "Meaning": "Kolmogorov-Smirnov goodness-of-fit test.",
+                "How to read it": "Smaller statistic and larger p-value usually indicate closer agreement.",
             },
             {
-                "Statistic": "AD Statistic",
-                "Meaning": "Anderson-Darling test statistic, with extra sensitivity in the tails.",
-                "How to read it": "Lower is better, especially when you care about extreme events and rare-life behavior.",
-            },
-            {
-                "Statistic": "AD P-Value",
-                "Meaning": "Anderson-Darling p-value for the fitted distribution.",
-                "How to read it": "Higher is usually better because it suggests the tail behavior is not strongly contradicted by the data.",
-            },
-            {
-                "Statistic": "R^2",
-                "Meaning": "A bounded fit score derived from the empirical-versus-fitted CDF comparison.",
-                "How to read it": "Higher is better; here it is used as an intuitive goodness-of-fit score rather than a literal regression R^2.",
+                "Statistic": "AD test",
+                "Meaning": "Anderson-Darling goodness-of-fit test.",
+                "How to read it": "Puts more weight on the tails, which is useful when rare high-stress events matter.",
             },
         ]
     )
@@ -364,16 +314,6 @@ def confidence_summary_frame(result: WeibullResult) -> pd.DataFrame:
 
     rows.extend(
         [
-            {
-                "Metric": "Weibull beta",
-                "Estimate": fmt_num(result.beta, 3),
-                "95% CI": fmt_interval(result.beta_ci, lambda entry: fmt_num(entry, 3)),
-            },
-            {
-                "Metric": "Weibull eta",
-                "Estimate": fmt_num(result.eta),
-                "95% CI": fmt_interval(result.eta_ci, fmt_num),
-            },
             {
                 "Metric": "Characteristic value",
                 "Estimate": fmt_num(result.characteristic_value),
