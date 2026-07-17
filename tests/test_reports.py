@@ -3,7 +3,12 @@ import unittest
 import pandas as pd
 
 from core.optimization import DistributionFit
-from reports.table_formatter import distribution_comparison_frame, formatted_results_frame, highest_risk_component_text
+from reports.table_formatter import (
+    distribution_comparison_frame,
+    fleet_summary_table_frame,
+    formatted_results_frame,
+    highest_risk_component_text,
+)
 
 
 class ReportsTests(unittest.TestCase):
@@ -81,9 +86,39 @@ class ReportsTests(unittest.TestCase):
         frame = distribution_comparison_frame((fit,))
         self.assertEqual(frame.loc[0, "Distribution"], "Weibull")
         self.assertEqual(frame.loc[0, "Best Fit"], "YES")
-        self.assertEqual(frame.loc[0, "Fit % (R^2-like)"], "96.50%")
+        self.assertEqual(frame.loc[0, "R^2"], "96.50%")
         self.assertEqual(frame.loc[0, "RMSE"], "0.0420")
         self.assertIn("beta=2.300", frame.loc[0, "Parameters"])
+
+    def test_fleet_summary_table_frame_is_user_friendly(self):
+        df = pd.DataFrame(
+            [
+                {
+                    "Component": "Pump A",
+                    "Selected Distribution": "Weibull",
+                    "Parameter 1 Label": "beta",
+                    "Parameter 1": 2.3,
+                    "Parameter 2 Label": "eta",
+                    "Parameter 2": 1200.0,
+                    "Characteristic Value": 1200.0,
+                    "MTTF": 1100.0,
+                    "MTBF": 1120.0,
+                    "Conditional Reliability": 0.25,
+                    "Conditional Probability of Failure": 0.75,
+                    "RUL": 450.0,
+                    "Optimal Replacement": 900.0,
+                    "Min Cost Rate": 12.5,
+                    "Failure Mode": "Wear-out",
+                    "Risk": "HIGH",
+                    "RPN": 160,
+                }
+            ]
+        )
+        frame = fleet_summary_table_frame(df)
+        self.assertNotIn("Primary Parameter", frame.columns)
+        self.assertNotIn("Secondary Parameter", frame.columns)
+        self.assertEqual(frame.loc[0, "Conditional Reliability"], 25.0)
+        self.assertEqual(frame.loc[0, "Failure Probability"], 75.0)
 
 
 if __name__ == "__main__":

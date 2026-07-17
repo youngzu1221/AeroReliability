@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from io import BytesIO
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
 from core.optimization import SUPPORTED_DISTRIBUTIONS, distribution_ppf
 from core.reliability import analyze_datasets, decision_from_metrics, results_to_frame
+from core.weibull_math import failure_mode_from_beta
 from data.excel_parser import deserialize_datasets, parse_excel, serialize_datasets
 from data.templates import build_template_workbook
 from plotting.cost_plots import build_cost_curve_figure
@@ -21,6 +23,8 @@ from reports.table_formatter import (
     confidence_summary_frame,
     distribution_comparison_frame,
     distribution_descriptions_frame,
+    fleet_summary_table_frame,
+    fit_stat_descriptions_frame,
     fmt_money,
     fmt_pct,
     formatted_results_frame,
@@ -31,8 +35,19 @@ from reports.table_formatter import (
 )
 from ui.sidebar import render_sidebar
 
-ANALYSIS_CACHE_VERSION = "2026-05-14-analysis-v2"
-REPORT_CACHE_VERSION = "2026-05-14-report-v2"
+ANALYSIS_CACHE_VERSION = "2026-07-17-analysis-v4"
+REPORT_CACHE_VERSION = "2026-07-17-report-v3"
+LOGO_PATH = Path(__file__).resolve().parents[1] / "assets" / "ethiopian_airlines_logo.png"
+PARAMETER_DISPLAY_LABELS = {
+    "beta": "Beta (shape)",
+    "eta": "Eta (scale)",
+    "sigma": "Sigma",
+    "loc": "Location (loc)",
+    "scale": "Scale",
+    "shape": "Shape",
+    "mean": "Mean",
+    "std": "Std Dev",
+}
 
 
 @st.cache_data(show_spinner=False)
@@ -95,10 +110,20 @@ def build_report_cached(
     )
 
 
+def parameter_display_label(label: str) -> str:
+    normalized = str(label).strip().lower()
+    return PARAMETER_DISPLAY_LABELS.get(normalized, str(label).replace("_", " ").title())
+
+
 def render_dashboard() -> None:
-    st.set_page_config(page_title="Reliability & Weibull Pro Dashboard", page_icon="R", layout="wide")
-    st.title("Reliability & Weibull Predictive Dashboard Pro")
-    st.caption("Upload an Excel workbook where each column is one component and each value is a positive failure/runtime observation.")
+    st.set_page_config(page_title="Reliability Dashboard", page_icon="R", layout="wide")
+    title_col, logo_col = st.columns([5.0, 1.7])
+    with title_col:
+        st.title("Reliability Dashboard")
+        st.caption("Upload an Excel workbook where each column is one component and each value is a positive failure/runtime observation.")
+    with logo_col:
+        if LOGO_PATH.exists():
+            st.image(str(LOGO_PATH), width=230)
 
     sidebar = render_sidebar()
     st.session_state.setdefault("selected_distribution_method", "Weibull")
@@ -178,7 +203,7 @@ def render_dashboard() -> None:
     metric_5.metric("Average MTTF", f"{df_results['MTTF'].mean():,.2f}")
 
     distribution_tab, summary_tab, detail_tab, export_tab = st.tabs(
-        ["Distribution Selection", "Fleet Summary", "Component Deep Dive", "Export"]
+        ["Distribution Selection", "Component Summary", "Component Deep Dive", "Export"]
     )
 
     with distribution_tab:
@@ -209,31 +234,95 @@ def render_dashboard() -> None:
         st.subheader("Distribution Reference Guide")
         st.dataframe(distribution_descriptions_frame(), use_container_width=True, hide_index=True)
 
+        st.subheader("Goodness-of-Fit Statistic Guide")
+        st.dataframe(fit_stat_descriptions_frame(), use_container_width=True, hide_index=True)
+
     with summary_tab:
         st.subheader("Full Reliability Results")
-        st.dataframe(formatted_results_frame(df_results), use_container_width=True, hide_index=True)
-        distribution_mix = (
-            df_results["Best Fit Distribution"]
-            .value_counts()
-            .rename_axis("Distribution")
-            .reset_index(name="Components")
+        filter_1, filter_2, filter_3, filter_4 = st.columns([1.4, 1.0, 1.0, 1.0])
+        component_options = ["All", *sorted(df_results["Component"].astype(str).tolist())]
+        selected_component_filter = filter_1.selectbox("Component", component_options, key="summary_component_filter")
+        risk_options = sorted(df_results["Risk"].dropna().unique().tolist())
+        selected_risk = filter_2.selectbox("Risk", ["", *risk_options], key="summary_risk_filter")
+        failure_mode_options = sorted(df_results["Failure Mode"].dropna().unique().tolist())
+        selected_failure_mode = filter_3.selectbox(
+            "Failure mode",
+            ["", *failure_mode_options],
+            key="summary_failure_mode_filter",
         )
-        left, right = st.columns([1.2, 1.0])
-        with left:
-            high_risk = df_results[df_results["Risk"] == "HIGH"]
-            if not high_risk.empty:
-                st.error(f"{len(high_risk)} component(s) are currently classified as HIGH risk.")
-            else:
-                st.success("No component is currently classified as HIGH risk.")
+        sort_labels = {
+            "Failure Probability": "Conditional Probability of Failure",
+            "RUL": "RUL",
+            "MTTF": "MTTF",
+            "Optimal Replacement": "Optimal Replacement",
+            "Min Cost Rate": "Min Cost Rate",
+        }
+        selected_sort = filter_4.selectbox("Sort by", ["", *list(sort_labels)], key="summary_sort_by")
+        descending = st.toggle("Descending sort", value=True, key="summary_sort_desc", disabled=selected_sort == "")
+
+        filtered_df = df_results.copy()
+        if selected_component_filter != "All":
+            filtered_df = filtered_df[filtered_df["Component"].astype(str) == selected_component_filter]
+        if selected_risk:
+            filtered_df = filtered_df[filtered_df["Risk"] == selected_risk]
+        if selected_failure_mode:
+            filtered_df = filtered_df[filtered_df["Failure Mode"] == selected_failure_mode]
+
+        if filtered_df.empty:
+            st.warning("No components match the current summary filters.")
+        else:
+            if selected_sort:
+                filtered_df = filtered_df.sort_values(sort_labels[selected_sort], ascending=not descending)
+            filtered_df = filtered_df.reset_index(drop=True)
+            fleet_1, fleet_2, fleet_3, fleet_4 = st.columns(4)
+            fleet_1.metric("Components Shown", f"{len(filtered_df)}")
+            fleet_2.metric(
+                "Highest Failure Probability",
+                fmt_pct(float(filtered_df["Conditional Probability of Failure"].max())),
+            )
+            fleet_3.metric("Average MTTF", f"{filtered_df['MTTF'].mean():,.2f}")
+            fleet_4.metric("High-Risk Components", f"{int((filtered_df['Risk'] == 'HIGH').sum())}")
             st.caption("Fleet metrics on this tab are calculated using the distribution you selected on the first tab.")
-        with right:
-            st.subheader("Best-Fit Distribution Mix")
-            st.dataframe(distribution_mix, use_container_width=True, hide_index=True)
+            summary_table = fleet_summary_table_frame(filtered_df)
+            st.dataframe(
+                summary_table,
+                use_container_width=True,
+                hide_index=True,
+                height=min(620, 92 + 42 * max(len(summary_table), 1)),
+                column_config={
+                    "Component": st.column_config.TextColumn("Component", width="medium"),
+                    "Distribution": st.column_config.TextColumn("Distribution", width="small"),
+                    "Characteristic Value": st.column_config.NumberColumn("Characteristic Value", format="%.2f"),
+                    "MTTF": st.column_config.NumberColumn("MTTF", format="%.2f"),
+                    "MTBF": st.column_config.NumberColumn("MTBF", format="%.2f"),
+                    "Conditional Reliability": st.column_config.ProgressColumn(
+                        "Conditional Reliability",
+                        help="Probability of surviving the mission window given survival to the current in-service time.",
+                        min_value=0.0,
+                        max_value=100.0,
+                        format="%.2f%%",
+                    ),
+                    "Failure Probability": st.column_config.ProgressColumn(
+                        "Failure Probability",
+                        help="Probability of failing in the mission window given survival to the current in-service time.",
+                        min_value=0.0,
+                        max_value=100.0,
+                        format="%.2f%%",
+                    ),
+                    "RUL": st.column_config.NumberColumn("RUL", format="%.2f"),
+                    "Optimal Replacement": st.column_config.NumberColumn("Optimal Replacement", format="%.2f"),
+                    "Min Cost Rate": st.column_config.NumberColumn("Min Cost Rate", format="$%.2f"),
+                    "Failure Mode": st.column_config.TextColumn("Failure Mode"),
+                    "Risk": st.column_config.TextColumn("Risk"),
+                    "RPN": st.column_config.NumberColumn("RPN", format="%d"),
+                },
+            )
 
     with detail_tab:
         selected_component = st.selectbox("Select component", list(analysis.keys()), key="selected_component")
         result = analysis[selected_component]
         decision = decision_from_metrics(result.conditional_failure_probability, result.optimal_replacement)
+        beta_interpretation = failure_mode_from_beta(result.beta)
 
         st.markdown(f"### {selected_component}")
         head_1, head_2, head_3, head_4, head_5 = st.columns(5)
@@ -249,6 +338,25 @@ def render_dashboard() -> None:
         m3.metric("RUL", f"{result.rul:,.2f}")
         m4.metric("Optimal Replacement", f"{result.optimal_replacement:,.2f}")
         m5.metric("Min Cost Rate", fmt_money(result.min_cost_rate))
+
+        parameter_metrics: list[tuple[str, str]] = []
+        for label, value in zip(result.selected_param_labels, result.selected_param_values, strict=False):
+            normalized = str(label).strip().lower()
+            if result.selected_distribution == "Weibull" and normalized == "eta":
+                continue
+            parameter_metrics.append((parameter_display_label(str(label)), f"{float(value):,.3f}"))
+
+        if result.selected_distribution == "Weibull":
+            parameter_metrics.append(("Beta Interpretation", beta_interpretation))
+        elif len(parameter_metrics) == 1:
+            parameter_metrics.append(("Failure Behavior", result.failure_mode))
+
+        param_columns = st.columns(len(parameter_metrics))
+        for col, (label, value) in zip(param_columns, parameter_metrics, strict=False):
+            col.metric(label, value)
+
+        if result.selected_distribution == "Weibull":
+            st.caption("Weibull beta guide: Beta < 0.95 = infant mortality, 0.95 to 1.05 = random failure, Beta > 1.05 = wear-out.")
 
         if decision.level == "HIGH":
             st.error(decision.message)
@@ -382,6 +490,13 @@ def render_dashboard() -> None:
         )
 
     st.caption("All future risk metrics are conditional on surviving to the current in-service time.")
+    st.markdown(
+        "<div style='text-align:center; font-weight:600; margin-top:1.5rem;'>"
+        "&copy;2026 - Ethiopian Airlines.<br/>"
+        "Developed by Zelalem Geremew and Daniel Jobrie"
+        "</div>",
+        unsafe_allow_html=True,
+    )
 
 
 def main() -> None:

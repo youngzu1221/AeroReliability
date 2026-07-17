@@ -7,7 +7,14 @@ from matplotlib.ticker import MultipleLocator
 from core.optimization import DistributionFit, distribution_cdf, distribution_hazard, distribution_pdf
 from core.reliability import WeibullResult
 from core.weibull_math import EPS, distribution_time_limits
-from plotting.styling import apply_axis_bounds_and_units, axis_limits, axis_limits_with_margin, plot_axis_config, plot_padding
+from plotting.styling import (
+    apply_axis_bounds_and_units,
+    axis_limits,
+    axis_limits_with_margin,
+    nice_major_unit,
+    plot_axis_config,
+    plot_padding,
+)
 
 MODEL_COLORS = {
     "Weibull": "#0b7285",
@@ -20,6 +27,52 @@ MODEL_COLORS = {
 }
 OBSERVATION_COLOR = "#1d3557"
 CHARACTERISTIC_COLOR = "#e63946"
+
+
+def _safe_numeric_series(values: np.ndarray | float, fallback: float = 0.0) -> np.ndarray:
+    arr = np.asarray(values, dtype=float)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return np.full_like(arr, fallback, dtype=float)
+    return np.nan_to_num(
+        arr,
+        nan=fallback,
+        posinf=float(np.max(finite)),
+        neginf=float(np.min(finite)),
+    )
+
+
+def _safe_axis_limits_from_values(
+    values: np.ndarray | float,
+    pad: float,
+    *,
+    margin: float = 0.03,
+    floor: float | None = None,
+    fallback: tuple[float, float] = (0.0, 1.0),
+) -> tuple[float, float]:
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if floor is not None:
+        arr = arr[arr >= floor]
+
+    if arr.size == 0:
+        low, high = fallback
+    else:
+        low = float(np.min(arr))
+        high = float(np.max(arr))
+        low, high = axis_limits_with_margin(low, high, pad, margin=margin)
+
+    if floor is not None:
+        low = max(floor, low)
+        high = max(floor, high)
+
+    if not np.isfinite(low) or not np.isfinite(high) or high <= low:
+        low, high = fallback
+    elif np.isclose(high, low):
+        bump = max(abs(high) * 0.1, 1.0)
+        low = floor if floor is not None else low - bump
+        high = high + bump
+    return float(low), float(high)
 
 
 def _ordered_distribution_fits(result: WeibullResult) -> list[DistributionFit]:
@@ -52,9 +105,9 @@ def build_distribution_fit_figure(
     color = MODEL_COLORS.get(fit.name, "#1f77b4")
     characteristic_value = float(result.characteristic_value)
 
-    pdf_curve = np.asarray(distribution_pdf(fit.name, fit.params, distribution_range), dtype=float)
-    cdf_curve = np.asarray(distribution_cdf(fit.name, fit.params, distribution_range), dtype=float)
-    pdf_points = _observation_pdf_points(result, fit)
+    pdf_curve = _safe_numeric_series(distribution_pdf(fit.name, fit.params, distribution_range))
+    cdf_curve = np.clip(_safe_numeric_series(distribution_cdf(fit.name, fit.params, distribution_range)), 0.0, 1.0)
+    pdf_points = _safe_numeric_series(_observation_pdf_points(result, fit))
 
     pdf_x_pad, pdf_y_pad = plot_padding(adjustment_target, "PDF", x_pad, y_pad)
     cdf_x_pad, cdf_y_pad = plot_padding(adjustment_target, "CDF", x_pad, y_pad)
@@ -62,7 +115,13 @@ def build_distribution_fit_figure(
     cdf_axis_config = plot_axis_config(adjustment_target, "CDF", axis_config)
 
     x_low, x_high = axis_limits(float(distribution_range.min()), float(distribution_range.max()), pdf_x_pad)
-    pdf_y_low, pdf_y_high = axis_limits_with_margin(0.0, float(max(np.max(pdf_curve), np.max(pdf_points))), pdf_y_pad, margin=0.04)
+    pdf_y_low, pdf_y_high = _safe_axis_limits_from_values(
+        np.concatenate((pdf_curve, pdf_points)),
+        pdf_y_pad,
+        margin=0.04,
+        floor=0.0,
+        fallback=(0.0, 1.0),
+    )
     cdf_y_margin = 0.03 + cdf_y_pad
 
     fig, axes = plt.subplots(1, 2, figsize=(11.7, 4.9 if for_pdf else 4.6))
@@ -120,7 +179,8 @@ def build_distribution_comparison_figure(
 
     for fit in ordered_fits:
         color = MODEL_COLORS.get(fit.name, None)
-        axes[0].plot(distribution_range, distribution_pdf(fit.name, fit.params, distribution_range), color=color, linewidth=1.8, label=fit.name)
+        model_pdf = _safe_numeric_series(distribution_pdf(fit.name, fit.params, distribution_range))
+        axes[0].plot(distribution_range, model_pdf, color=color, linewidth=1.8, label=fit.name)
     axes[0].scatter(data, selected_points, s=24, color=OBSERVATION_COLOR, label="Observations", zorder=3)
     axes[0].set_title("PDF Comparison")
     axes[0].set_xlabel("Time")
@@ -132,7 +192,8 @@ def build_distribution_comparison_figure(
     x_low_cdf, x_high_cdf = axis_limits(float(distribution_range.min()), float(distribution_range.max()), cdf_x_pad)
     for fit in ordered_fits:
         color = MODEL_COLORS.get(fit.name, None)
-        axes[1].plot(distribution_range, distribution_cdf(fit.name, fit.params, distribution_range), color=color, linewidth=1.8, label=fit.name)
+        model_cdf = np.clip(_safe_numeric_series(distribution_cdf(fit.name, fit.params, distribution_range)), 0.0, 1.0)
+        axes[1].plot(distribution_range, model_cdf, color=color, linewidth=1.8, label=fit.name)
     axes[1].scatter(data, median_ranks, s=24, color=OBSERVATION_COLOR, label="Observations", zorder=3)
     axes[1].set_title("CDF Comparison")
     axes[1].set_xlabel("Time")
@@ -157,12 +218,19 @@ def build_hazard_function_figure(
     start = max(EPS, float(np.min(result.data)) * 0.5)
     end = max(float(np.max(result.data)) * 1.8, result.characteristic_value * 1.3, start + 1.0)
     hazard_range = np.linspace(start, end, 1000)
-    hazard_values = np.asarray(distribution_hazard(fit.name, fit.params, hazard_range), dtype=float)
+    hazard_values = _safe_numeric_series(distribution_hazard(fit.name, fit.params, hazard_range))
 
     haz_x_pad, haz_y_pad = plot_padding(adjustment_target, "Hazard Function", x_pad, y_pad)
     haz_axis_config = plot_axis_config(adjustment_target, "Hazard Function", axis_config)
     x_low, x_high = axis_limits(float(hazard_range.min()), float(hazard_range.max()), haz_x_pad)
-    y_low, y_high = axis_limits_with_margin(float(np.min(hazard_values)), float(np.max(hazard_values)), haz_y_pad, margin=0.04)
+    x_low = 0.0
+    y_low, y_high = _safe_axis_limits_from_values(
+        hazard_values,
+        haz_y_pad,
+        margin=0.04,
+        floor=0.0,
+        fallback=(0.0, 1.0),
+    )
 
     fig, ax = plt.subplots(figsize=(11.7, 4.0))
     ax.plot(hazard_range, hazard_values, color=MODEL_COLORS.get(fit.name, "#1f77b4"), linewidth=2.0, label=f"{fit.name} hazard")
@@ -172,7 +240,10 @@ def build_hazard_function_figure(
     ax.set_ylabel("Failure rate")
     apply_axis_bounds_and_units(ax, haz_axis_config, (x_low, x_high), (y_low, y_high))
     if not haz_axis_config.get("use_major_units"):
-        ax.xaxis.set_major_locator(MultipleLocator(500.0))
+        x_major_unit = nice_major_unit(x_high - x_low, target_ticks=6)
+        ax.set_xticks(np.arange(0.0, x_high + (0.5 * x_major_unit), x_major_unit))
+        ax.set_xlim(x_low, x_high)
+    ax.ticklabel_format(style="plain", axis="x", useOffset=False)
     ax.grid(True, linestyle="--", alpha=0.4)
     ax.legend(fontsize=9)
     fig.tight_layout()
@@ -197,7 +268,8 @@ def build_forward_risk_figure(
     if requested_horizon <= 0:
         conditional_rel = np.ones_like(future_times)
         conditional_fail = np.zeros_like(future_times)
-        haz = np.full_like(future_times, float(distribution_hazard(fit.name, fit.params, current_age)))
+        base_hazard = _safe_numeric_series(distribution_hazard(fit.name, fit.params, current_age), fallback=0.0)
+        haz = np.full_like(future_times, float(base_hazard.reshape(-1)[0]))
         rel_low = rel_high = conditional_rel
         fail_low = fail_high = conditional_fail
     else:
@@ -205,7 +277,7 @@ def build_forward_risk_figure(
         conditional_rel = rel / current_rel if current_rel > EPS else np.zeros_like(rel)
         conditional_rel = np.clip(conditional_rel, 0.0, 1.0)
         conditional_fail = 1.0 - conditional_rel
-        haz = distribution_hazard(fit.name, fit.params, future_times)
+        haz = _safe_numeric_series(distribution_hazard(fit.name, fit.params, future_times))
 
         param_samples = result.bootstrap_param_samples
         bootstrap_rel = np.asarray(
@@ -240,7 +312,13 @@ def build_forward_risk_figure(
     rel_x_low, rel_x_high = axis_limits(float(future_times.min()), float(future_times.max()), rel_x_pad)
     fail_x_low, fail_x_high = axis_limits(float(future_times.min()), float(future_times.max()), fail_x_pad)
     haz_x_low, haz_x_high = axis_limits(float(future_times.min()), float(future_times.max()), haz_x_pad)
-    haz_y_low, haz_y_high = axis_limits_with_margin(float(np.min(haz)), float(np.max(haz)), haz_y_pad, margin=0.04)
+    haz_y_low, haz_y_high = _safe_axis_limits_from_values(
+        haz,
+        haz_y_pad,
+        margin=0.04,
+        floor=0.0,
+        fallback=(0.0, 1.0),
+    )
 
     fig, axes = plt.subplots(1, 3, figsize=(11.7, 4.2))
     rel_y_margin = 0.03 + rel_y_pad
