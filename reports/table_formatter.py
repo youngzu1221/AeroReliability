@@ -125,8 +125,6 @@ def fleet_summary_table_frame(df: pd.DataFrame) -> pd.DataFrame:
             {
                 "Component": str(row["Component"]),
                 "Distribution": str(row["Selected Distribution"]),
-                "Primary Parameter": _parameter_cell(row.get("Parameter 1 Label"), row.get("Parameter 1")),
-                "Secondary Parameter": _parameter_cell(row.get("Parameter 2 Label"), row.get("Parameter 2")),
                 "Characteristic Value": float(row["Characteristic Value"]),
                 "MTTF": float(row["MTTF"]),
                 "MTBF": float(row["MTBF"]),

@@ -96,8 +96,8 @@ def build_report_cached(
 
 
 def render_dashboard() -> None:
-    st.set_page_config(page_title="Reliability Dashboard", page_icon="R", layout="wide")
-    st.title("Reliability Dashboard")
+    st.set_page_config(page_title="Reliability & Weibull Pro Dashboard", page_icon="R", layout="wide")
+    st.title("Reliability & Weibull Predictive Dashboard Pro")
     st.caption("Upload an Excel workbook where each column is one component and each value is a positive failure/runtime observation.")
 
     sidebar = render_sidebar()

@@ -35,9 +35,19 @@ from reports.table_formatter import (
 )
 from ui.sidebar import render_sidebar
 
-ANALYSIS_CACHE_VERSION = "2026-06-11-analysis-v3"
-REPORT_CACHE_VERSION = "2026-05-14-report-v2"
+ANALYSIS_CACHE_VERSION = "2026-07-17-analysis-v4"
+REPORT_CACHE_VERSION = "2026-07-17-report-v3"
 LOGO_PATH = Path(__file__).resolve().parents[1] / "assets" / "ethiopian_airlines_logo.png"
+PARAMETER_DISPLAY_LABELS = {
+    "beta": "Beta (shape)",
+    "eta": "Eta (scale)",
+    "sigma": "Sigma",
+    "loc": "Location (loc)",
+    "scale": "Scale",
+    "shape": "Shape",
+    "mean": "Mean",
+    "std": "Std Dev",
+}
 
 
 @st.cache_data(show_spinner=False)
@@ -98,6 +108,11 @@ def build_report_cached(
         y_pad,
         axis_config,
     )
+
+
+def parameter_display_label(label: str) -> str:
+    normalized = str(label).strip().lower()
+    return PARAMETER_DISPLAY_LABELS.get(normalized, str(label).replace("_", " ").title())
 
 
 def render_dashboard() -> None:
@@ -273,12 +288,10 @@ def render_dashboard() -> None:
                 summary_table,
                 use_container_width=True,
                 hide_index=True,
-                height=min(640, 76 + 35 * max(len(summary_table), 1)),
+                height=min(620, 92 + 42 * max(len(summary_table), 1)),
                 column_config={
-                    "Component": st.column_config.TextColumn("Component"),
-                    "Distribution": st.column_config.TextColumn("Distribution"),
-                    "Primary Parameter": st.column_config.TextColumn("Primary Parameter", width="medium"),
-                    "Secondary Parameter": st.column_config.TextColumn("Secondary Parameter", width="medium"),
+                    "Component": st.column_config.TextColumn("Component", width="medium"),
+                    "Distribution": st.column_config.TextColumn("Distribution", width="small"),
                     "Characteristic Value": st.column_config.NumberColumn("Characteristic Value", format="%.2f"),
                     "MTTF": st.column_config.NumberColumn("MTTF", format="%.2f"),
                     "MTBF": st.column_config.NumberColumn("MTBF", format="%.2f"),
@@ -326,8 +339,24 @@ def render_dashboard() -> None:
         m4.metric("Optimal Replacement", f"{result.optimal_replacement:,.2f}")
         m5.metric("Min Cost Rate", fmt_money(result.min_cost_rate))
 
-        w1, w2 = st.columns([1.0, 1.2])      
-        st.caption("Weibull beta guide: Beta < 0.95 = infant mortality, 0.95 to 1.05 = random failure, Beta > 1.05 = wear-out.")
+        parameter_metrics: list[tuple[str, str]] = []
+        for label, value in zip(result.selected_param_labels, result.selected_param_values, strict=False):
+            normalized = str(label).strip().lower()
+            if result.selected_distribution == "Weibull" and normalized == "eta":
+                continue
+            parameter_metrics.append((parameter_display_label(str(label)), f"{float(value):,.3f}"))
+
+        if result.selected_distribution == "Weibull":
+            parameter_metrics.append(("Beta Interpretation", beta_interpretation))
+        elif len(parameter_metrics) == 1:
+            parameter_metrics.append(("Failure Behavior", result.failure_mode))
+
+        param_columns = st.columns(len(parameter_metrics))
+        for col, (label, value) in zip(param_columns, parameter_metrics, strict=False):
+            col.metric(label, value)
+
+        if result.selected_distribution == "Weibull":
+            st.caption("Weibull beta guide: Beta < 0.95 = infant mortality, 0.95 to 1.05 = random failure, Beta > 1.05 = wear-out.")
 
         if decision.level == "HIGH":
             st.error(decision.message)

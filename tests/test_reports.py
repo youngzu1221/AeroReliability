@@ -115,8 +115,8 @@ class ReportsTests(unittest.TestCase):
             ]
         )
         frame = fleet_summary_table_frame(df)
-        self.assertEqual(frame.loc[0, "Primary Parameter"], "beta = 2.300")
-        self.assertEqual(frame.loc[0, "Secondary Parameter"], "eta = 1,200.000")
+        self.assertNotIn("Primary Parameter", frame.columns)
+        self.assertNotIn("Secondary Parameter", frame.columns)
         self.assertEqual(frame.loc[0, "Conditional Reliability"], 25.0)
         self.assertEqual(frame.loc[0, "Failure Probability"], 75.0)
 
