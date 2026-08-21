@@ -7,6 +7,7 @@ import pandas as pd
 import streamlit as st
 
 from core.optimization import SUPPORTED_DISTRIBUTIONS, distribution_ppf
+from core.mtbur import calculate_mtbur
 from core.reliability import analyze_datasets, decision_from_metrics, results_to_frame
 from core.weibull_math import failure_mode_from_beta
 from data.excel_parser import deserialize_datasets, parse_excel, serialize_datasets
@@ -115,6 +116,67 @@ def parameter_display_label(label: str) -> str:
     return PARAMETER_DISPLAY_LABELS.get(normalized, str(label).replace("_", " ").title())
 
 
+def render_mtbur_calculator() -> None:
+    st.subheader("MTBUR Calculator")
+    st.caption("Calculate Mean Time Between Unscheduled Removals for a fleet or operating period.")
+
+    exposure_basis = st.radio(
+        "Operating basis",
+        ["Flight hours", "Flight cycles"],
+        horizontal=True,
+        key="mtbur_exposure_basis",
+    )
+    exposure_label = "Total flight hours in the period" if exposure_basis == "Flight hours" else "Total flight cycles in the period"
+    exposure_unit = "flight hours" if exposure_basis == "Flight hours" else "flight cycles"
+
+    input_1, input_2, input_3 = st.columns(3)
+    total_exposure = input_1.number_input(
+        exposure_label,
+        min_value=0.0,
+        value=0.0,
+        step=100.0,
+        key="mtbur_total_exposure",
+    )
+    removals = input_2.number_input(
+        "Number of removals",
+        min_value=1,
+        value=1,
+        step=1,
+        key="mtbur_removals",
+    )
+    quantity_per_aircraft = input_3.number_input(
+        "Quantity per aircraft (QPA)",
+        min_value=1.0,
+        value=1.0,
+        step=1.0,
+        key="mtbur_qpa",
+    )
+
+    mtbur = calculate_mtbur(total_exposure, removals, quantity_per_aircraft)
+    installed_exposure = float(total_exposure) * float(quantity_per_aircraft)
+
+    st.latex(r"\mathrm{MTBUR} = \frac{\mathrm{Total\ Flight\ Hours/Cycles}\ \times\ \mathrm{QPA}}{\mathrm{Number\ of\ Removals}}")
+    metric_1, metric_2, metric_3 = st.columns(3)
+    metric_1.metric("MTBUR", f"{mtbur:,.2f} {exposure_unit}")
+    metric_2.metric("Total installed exposure", f"{installed_exposure:,.2f} {exposure_unit}")
+    metric_3.metric("Removals used", f"{int(removals):,}")
+    st.info(
+        f"MTBUR is {mtbur:,.2f} {exposure_unit}: "
+        f"{float(total_exposure):,.2f} total {exposure_unit} x {float(quantity_per_aircraft):,.2f} QPA / {int(removals):,} removals."
+    )
+
+
+def render_footer() -> None:
+    st.caption("All future risk metrics are conditional on surviving to the current in-service time.")
+    st.markdown(
+        "<div style='text-align:center; font-weight:600; margin-top:1.5rem;'>"
+        "&copy;2026 - Ethiopian Airlines.<br/>"
+        "Developed by Zelalem Geremew and Daniel Jobrie"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+
 def render_dashboard() -> None:
     st.set_page_config(page_title="Reliability Dashboard", page_icon="R", layout="wide")
     title_col, logo_col = st.columns([5.0, 1.7])
@@ -144,8 +206,22 @@ def render_dashboard() -> None:
             help="Expected format: one component per column, with at least two positive numeric observations in each usable column.",
         )
 
+    distribution_tab, summary_tab, detail_tab, mtbur_tab, export_tab = st.tabs(
+        ["Distribution Selection", "Component Summary", "Component Deep Dive", "MTBUR Calculator", "Export"]
+    )
+
     if uploaded_file is None:
-        st.info("Upload an Excel file to begin the analysis.")
+        with distribution_tab:
+            st.info("Upload an Excel file to compare distributions and begin the reliability analysis.")
+        with summary_tab:
+            st.info("Upload an Excel file to view the fleet summary.")
+        with detail_tab:
+            st.info("Upload an Excel file to view a component deep dive.")
+        with mtbur_tab:
+            render_mtbur_calculator()
+        with export_tab:
+            st.info("Upload an Excel file to prepare analysis exports.")
+        render_footer()
         return
 
     with st.spinner("Loading workbook and fitting distributions..."):
@@ -201,10 +277,6 @@ def render_dashboard() -> None:
     metric_3.metric("Highest Risk Component", highest_risk_component_text(df_results))
     metric_4.metric("Selected Distribution", selected_distribution)
     metric_5.metric("Average MTTF", f"{df_results['MTTF'].mean():,.2f}")
-
-    distribution_tab, summary_tab, detail_tab, export_tab = st.tabs(
-        ["Distribution Selection", "Component Summary", "Component Deep Dive", "Export"]
-    )
 
     with distribution_tab:
         st.subheader("Choose Distribution Method")
@@ -449,6 +521,9 @@ def render_dashboard() -> None:
         st.dataframe(metric_descriptions_frame(), use_container_width=True, hide_index=True)
         st.dataframe(plot_descriptions_frame(), use_container_width=True, hide_index=True)
 
+    with mtbur_tab:
+        render_mtbur_calculator()
+
     with export_tab:
         st.subheader("Download Outputs")
         selected_component = st.session_state.get("selected_component", list(analysis.keys())[0])
@@ -489,14 +564,7 @@ def render_dashboard() -> None:
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-    st.caption("All future risk metrics are conditional on surviving to the current in-service time.")
-    st.markdown(
-        "<div style='text-align:center; font-weight:600; margin-top:1.5rem;'>"
-        "&copy;2026 - Ethiopian Airlines.<br/>"
-        "Developed by Zelalem Geremew and Daniel Jobrie"
-        "</div>",
-        unsafe_allow_html=True,
-    )
+    render_footer()
 
 
 def main() -> None:

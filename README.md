@@ -3,7 +3,7 @@ Reliability Weibull Dashboard
 
 ## Structure
 
-- `core/`: Weibull math, optimization, reliability metrics, validation
+- `core/`: Weibull math, optimization, reliability metrics, MTBUR calculation, validation
 - `plotting/`: distribution plots, cost plots, axis styling helpers
 - `reports/`: PDF report generation and result-table formatting
 - `ui/`: sidebar inputs, controls, dashboard entry
